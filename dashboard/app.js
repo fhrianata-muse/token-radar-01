@@ -1,27 +1,43 @@
-// LaunchScope — Token Launch Radar (model radar-2).
+// LaunchScope — Token Launch Radar (model radar-2, dashboard v2).
 //
 // What this page is: a static dashboard over one sealed DefiLlama snapshot. main.ts computes
 // window.RADAR (in data.js, beside this folder) from the snapshot alone; this file only renders it.
-// No network, no fetch: every number on the page comes from that one dataset.
+// No network, no fetch: every number on the page comes from that one dataset, and every figure in
+// a protocol's detail view is the same figure the board and board.json carry.
 //
 // The model, in one paragraph: implied value = exp(a) x TVL^b x category offset x growth x maturity.
-// The power law (a, b) is an OLS fit of ln(market cap) on ln(TVL) over the snapshot's live-token
+// The power law (a, b) is an OLS fit of ln(market cap) on ln(TVL) over the snapshot's 128 live-token
 // protocols - the ones that already trade, kept separate from this board and shown below as the
 // calibration set. The category offset is the category's median log multiple shrunk toward the
 // global median (k=8, clamped to +/-0.35 log units); growth uses the 7-day TVL change at weight
 // 0.25; maturity rises from 0.85 to 1.00 over three years a protocol has run without a token.
-// Every candidate model, this one included, was scored by leave-one-out on the live-token set:
-// fit on the rest, predict the held-out market cap. The shipped model won that test; the table
-// this page renders (renderMethod) is computed at runtime from the same dataset, so the numbers
-// shown are the numbers the code produces - nothing here is a claim typed into a comment.
+// The model was validated three ways, all recomputed at build time and printed on this page:
+// leave-one-out over the 128 comps against 9 rival candidates, a walk-forward time split at two
+// cutoffs, and a coverage audit of the printed range bands against held-out predictions. Rank
+// ranges come from 200 bootstrap refits of the comp set with a fixed seed.
+//
+// The board's scope is one classification standard on both sides of the watchlist floor, computed
+// in code and printed as a partition of all 758 snapshot protocols below. Farm verdicts: the 40
+// watchlist rows carry verdicts from verified program research dated 2026-11-18 (program and
+// source named in each detail view); every other row's verdict comes from the stated odds rule
+// over one shared $1,000 scenario - a launch distributing 10% of implied value pro-rata across
+// TVL, minus the plan's transaction fees and forgone yield at 4% a year. The break-even figure
+// is the launch probability at which a farm would break even: a threshold, not a prediction.
 (function () {
   'use strict';
 
   var DATA = window.RADAR;
   if (!DATA) return;
   var app = document.getElementById('board');
+  var M = DATA.model;
+  var A = DATA.assumptions;
 
   // ---------- formatting ----------
+  function esc(s) {
+    return String(s === null || s === undefined ? '' : s)
+      .split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;')
+      .split('"').join('&quot;');
+  }
   function fmtUsd(n) {
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
     if (Math.abs(n) >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
@@ -29,276 +45,441 @@
     if (Math.abs(n) >= 1e3) return '$' + (n / 1e3).toFixed(1) + 'K';
     return '$' + Math.round(n);
   }
-  function fmtFullUsd(n) {
+  function fmtFull(n) {
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
-    return '$' + Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return '$' + Math.round(n).toLocaleString('en-US');
   }
-  function fmtPct(n) {
-    if (n === null || n === undefined) return 'n/a';
-    return (n > 0 ? '+' : '') + n.toFixed(1) + '%';
+  function fmtMoney2(n) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    var sign = n < 0 ? '-$' : '$';
+    return sign + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  function fmtPct(n, digits) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    return n.toFixed(digits === undefined ? 1 : digits) + '%';
+  }
+  function fmtChange(n) {
+    if (n === null || n === undefined || !isFinite(n)) return '<span class="sub">n/a</span>';
+    var cls = n > 0 ? 'pos' : n < 0 ? 'neg' : '';
+    return '<span class="' + cls + '">' + (n > 0 ? '+' : '') + n.toFixed(1) + '%</span>';
+  }
+  function fmtAge(days) {
+    if (days === null || days === undefined) return 'n/a';
+    if (days >= 730) return (days / 365).toFixed(1) + 'y';
+    if (days >= 60) return Math.round(days / 30.4) + 'mo';
+    return days + 'd';
   }
   function fmtMult(n) {
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
-    return n.toFixed(n < 0.1 ? 3 : 2) + 'x';
-  }
-  function esc(s) {
-    return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, function (c) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-    });
+    return 'x' + n.toFixed(2);
   }
 
-  // ---------- the model, as the dashboard explains it ----------
-  // The category's calibrated multiples from the live-token comps: {n, median, shrunk, p25, p75}.
-  function calibratedMultiple(category) {
-    for (var i = 0; i < DATA.categories.length; i++) {
-      if (DATA.categories[i].category === category) return DATA.categories[i];
-    }
-    return null;
-  }
-  // The farm plan main.ts built for this protocol from its category, chain and size.
-  function farmPlanFor(row) {
-    return row.farm_steps || [];
-  }
-  // The multiplicative breakdown of one row's implied value, in the order the model applies it.
-  function impliedValueBreakdown(row) {
-    var baseValue = row.tvl_usd * row.base_multiple;
-    return [
-      ['TVL (snapshot)', fmtFullUsd(row.tvl_usd)],
-      ['x base multiple (power law x category offset ' + fmtMult(row.cat_offset) + ')', row.base_multiple.toFixed(4)],
-      ['= base value', fmtFullUsd(baseValue)],
-      ['x growth (7d ' + fmtPct(row.change_7d) + ', weight 0.25)', row.growth_multiplier.toFixed(4)],
-      ['x maturity (' + (row.age_days === null ? 'age unreported' : row.age_days + ' days without a token') + ')', row.maturity_multiplier.toFixed(4)],
-      ['= implied value', fmtFullUsd(row.implied_value_usd)]
-    ];
-  }
-
-  // ---------- state, from the URL first so a view can be linked and screenshotted ----------
+  // ---------- state ----------
   var params = new URLSearchParams(location.search);
   var state = {
     q: params.get('q') || '',
-    category: params.get('category') || 'all',
-    chain: params.get('chain') || 'all',
-    watchlistOnly: params.get('watchlist') === '1',
-    sort: params.get('sort') || 'implied',
-    detail: params.get('detail') || null
+    cat: params.get('cat') || '',
+    verdict: params.get('verdict') || '',
+    wl: params.get('wl') === '1',
+    sort: params.get('sort') || 'rank',
+    detail: params.get('detail') || '',
   };
+  var rowsBySlug = {};
+  DATA.rows.forEach(function (r) { rowsBySlug[r.slug] = r; });
 
-  function sortRows(rows) {
-    var out = rows.slice();
-    if (state.sort === 'tvl') out.sort(function (a, b) { return b.tvl_usd - a.tvl_usd; });
-    else if (state.sort === 'growth') out.sort(function (a, b) { return (b.change_7d || 0) - (a.change_7d || 0); });
-    else if (state.sort === 'youngest') out.sort(function (a, b) {
-      var x = a.age_days === null ? 1e12 : a.age_days, y = b.age_days === null ? 1e12 : b.age_days;
-      return x - y;
-    });
-    else out.sort(function (a, b) { return b.implied_value_usd - a.implied_value_usd; });
-    return out;
+  function syncUrl() {
+    var p = new URLSearchParams();
+    if (state.q) p.set('q', state.q);
+    if (state.cat) p.set('cat', state.cat);
+    if (state.verdict) p.set('verdict', state.verdict);
+    if (state.wl) p.set('wl', '1');
+    if (state.sort !== 'rank') p.set('sort', state.sort);
+    var s = p.toString();
+    history.replaceState(null, '', s ? '?' + s : location.pathname);
   }
 
-  function applyFilters() {
-    var q = state.q.trim().toLowerCase();
-    return sortRows(DATA.rows.filter(function (row) {
-      if (state.watchlistOnly && !row.watchlist) return false;
-      if (state.category !== 'all' && row.category !== state.category) return false;
-      if (state.chain !== 'all' && row.chains.indexOf(state.chain) === -1) return false;
-      if (q && (row.name + ' ' + row.slug + ' ' + (row.category || '')).toLowerCase().indexOf(q) === -1) return false;
-      return true;
-    }));
-  }
-
-  // ---------- rendering ----------
-  function renderHeader() {
-    return '<header class="top"><div>' +
-      '<div class="kicker">LaunchScope · model ' + esc(DATA.model_version) + '</div>' +
-      '<h1>Token Launch Radar</h1>' +
-      '<p>Every protocol in one sealed DefiLlama snapshot that records no token yet, ranked by what its launch would be worth if its record stayed as it is - with the steps to farm each one. Live-token protocols are never ranked; they are the calibration set below.</p>' +
+  // ---------- shared blocks ----------
+  function headerHtml(slim) {
+    return '<header class="top' + (slim ? ' slim' : '') + '"><div>' +
+      '<div class="kicker">LaunchScope &middot; model ' + esc(DATA.model_version) + '</div>' +
+      '<h1>Token launch radar</h1>' +
+      '<p>Every stand-alone pre-token protocol in the snapshot, ranked by the value the traded market would plausibly give it — with a farm verdict and net-of-cost economics on every row. Watchlist coverage: <b>' + DATA.coverage + ' of ' + DATA.watchlist_size + '</b>.</p>' +
       '</div><div class="top-meta">' +
-      '<span>Snapshot as of <b>' + esc(DATA.as_of) + '</b></span>' +
-      '<span>Source <b>DefiLlama protocols, sealed</b></span>' +
-      '<span>Model <b>' + esc(DATA.model_version) + ' (leave-one-out winner)</b></span>' +
+      '<span>Snapshot <b>' + esc(DATA.as_of) + '</b></span>' +
+      '<span><b>' + DATA.scanned_size + '</b> protocols scanned</span>' +
+      '<span><b>' + DATA.board_size + '</b> ranked &middot; <b>' + DATA.comps_size + '</b> live comps</span>' +
+      '<span>Verdicts: <b>' + DATA.verdict_counts.FARM + ' FARM</b> &middot; ' + DATA.verdict_counts.THIN + ' THIN &middot; ' + DATA.verdict_counts.SKIP + ' SKIP</span>' +
       '</div></header>';
   }
 
-  function renderStats() {
-    var chips = [
-      [DATA.scanned_size, 'protocols scanned', false],
-      [DATA.comps_size, 'live-token comps fit the model', false],
-      [DATA.board_size, 'pre-token protocols ranked', false],
-      [DATA.watchlist_size + '/' + DATA.watchlist_size, 'watchlist covered', true],
-      [DATA.live_size, 'live tokens shown separately', false]
-    ];
-    return '<div class="stats">' + chips.map(function (c) {
-      return '<div class="stat' + (c[2] ? ' amber' : '') + '"><b>' + c[0] + '</b><span>' + c[1] + '</span></div>';
-    }).join('') + '</div>';
+  function stripHtml() {
+    var p = DATA.partition;
+    var setAside = p.staking_products + p.bridge_products + p.named_products;
+    var oddCaps = p.zero_cap + p.sentinel_cap;
+    function seg(label, n, hot) {
+      return '<span class="seg' + (hot ? ' hot' : '') + '"><b>' + n + '</b> ' + label + '</span>';
+    }
+    return '<div class="strip">' +
+      seg('ranked on this board', p.ranked, true) +
+      seg('already trading (calibration comps)', p.trading) +
+      seg('sub-products of traded tokens', p.sub_products) +
+      seg('exchanges', p.exchanges) +
+      seg('versioned pools', p.versioned) +
+      seg('products of traded assets, set aside', setAside) +
+      seg('token recorded, cap $0 or sentinel', oddCaps) +
+      seg('of ' + p.total + ' accounted for', p.total) +
+      '</div>';
   }
 
-  function optionList(values, current, allLabel) {
-    var html = '<option value="all">' + allLabel + '</option>';
-    values.forEach(function (v) {
-      html += '<option value="' + esc(v) + '"' + (v === current ? ' selected' : '') + '>' + esc(v) + '</option>';
-    });
+  function footerHtml() {
+    return '<footer><p>Data: the sealed snapshot of ' + esc(DATA.as_of) + ' (' + esc(DATA.source) + '). Every figure on this page is recomputed from that snapshot by the shipped code at build time; the page works fully offline.</p>' +
+      '<p>Implied value is a calibration against traded protocols, not a price prediction, and no farm plan here promises a token, points or a return.</p></footer>';
+  }
+
+  function verdictChip(v) {
+    return '<span class="chip ' + v + '">' + v + '</span>';
+  }
+
+  // ---------- board page ----------
+  function categoriesPresent() {
+    var seen = {};
+    DATA.rows.forEach(function (r) { if (r.category) seen[r.category] = true; });
+    return Object.keys(seen).sort();
+  }
+
+  function rowMatches(r) {
+    if (state.wl && !r.watchlist) return false;
+    if (state.cat && r.category !== state.cat) return false;
+    if (state.verdict && r.verdict !== state.verdict) return false;
+    if (state.q) {
+      var hay = (r.name + ' ' + r.slug + ' ' + (r.category || '') + ' ' + r.chains.join(' ')).toLowerCase();
+      if (hay.indexOf(state.q.toLowerCase()) === -1) return false;
+    }
+    return true;
+  }
+
+  function sortedRows(list) {
+    var out = list.slice();
+    function byNum(fn, desc) {
+      out.sort(function (a, b) {
+        var x = fn(a), y = fn(b);
+        if (x === null || x === undefined) return 1;
+        if (y === null || y === undefined) return -1;
+        return desc ? y - x : x - y;
+      });
+    }
+    if (state.sort === 'implied') byNum(function (r) { return r.implied_value_usd; }, true);
+    else if (state.sort === 'net') byNum(function (r) { return r.econ.net_usd; }, true);
+    else if (state.sort === 'hour') byNum(function (r) { return r.econ.per_hour_usd; }, true);
+    else if (state.sort === 'tvl') byNum(function (r) { return r.tvl_usd; }, true);
+    else if (state.sort === 'growth') byNum(function (r) { return r.change_7d; }, true);
+    else if (state.sort === 'young') byNum(function (r) { return r.age_days; }, false);
+    else out.sort(function (a, b) { return a.rank - b.rank; });
+    return out;
+  }
+
+  function showNetCols() {
+    return state.verdict !== '' || state.sort === 'net' || state.sort === 'hour';
+  }
+
+  function renderRows() {
+    var list = sortedRows(DATA.rows.filter(rowMatches));
+    var net = showNetCols();
+    var head = '<tr><th class="r">#</th><th>Protocol</th><th>Category</th><th>Chains</th>' +
+      '<th class="r">TVL</th><th class="r">7d</th><th class="r">Implied</th><th class="r">xTVL</th>' +
+      (net ? '' : '<th>Range (p25–p75)</th>') + '<th class="r">Rank range</th>' +
+      (net ? '<th class="r">Farm net</th><th class="r">$/hour</th>' : '') +
+      '<th>Verdict</th></tr>';
+    document.getElementById('boardHead').innerHTML = head;
+    var html = list.map(function (r) {
+      var wide = r.range_hi / Math.max(1, r.range_lo) > 16;
+      return '<tr data-slug="' + esc(r.slug) + '">' +
+        '<td class="r num">' + r.rank + '</td>' +
+        '<td class="pcell"><span class="pname">' + esc(r.name) + '</span>' +
+        '<br><span class="slug">' + esc(r.slug) + '</span>' + (r.watchlist ? '<span class="tag">WATCHLIST</span>' : '') + '</td>' +
+        '<td class="cat">' + esc(r.category || 'Uncategorised') + '</td>' +
+        '<td class="chains">' + esc(r.chains.slice(0, 2).join(', ')) + (r.chains.length > 2 ? ' +' + (r.chains.length - 2) : '') + '</td>' +
+        '<td class="r num">' + fmtUsd(r.tvl_usd) + '</td>' +
+        '<td class="r num">' + fmtChange(r.change_7d) + '</td>' +
+        '<td class="r num"><b>' + fmtUsd(r.implied_value_usd) + '</b></td>' +
+        '<td class="r num">' + fmtMult(r.eff_multiple) + '</td>' +
+        (net ? '' : '<td class="num rangecell">' + fmtUsd(r.range_lo) + ' – ' + fmtUsd(r.range_hi) + (wide ? ' <span class="wideband">wide band</span>' : '') + '</td>') +
+        '<td class="r num">' + r.rank_lo + '–' + r.rank_hi + '</td>' +
+        (net ? '<td class="r num">' + fmtMoney2(r.econ.net_usd) + '</td><td class="r num">' + fmtMoney2(r.econ.per_hour_usd) + '</td>' : '') +
+        '<td>' + verdictChip(r.verdict) + '</td></tr>';
+    }).join('');
+    document.getElementById('boardBody').innerHTML = html || '<tr><td colspan="13" class="sub">No protocol matches the current filters.</td></tr>';
+    document.getElementById('countLine').textContent = list.length + ' of ' + DATA.board_size + ' protocols';
+  }
+
+  function looRow(v) {
+    return '<tr' + (v.winner ? ' class="win"' : '') + '><td>' + esc(v.id) + ' — ' + esc(v.label) + '</td>' +
+      '<td class="r num">' + v.mean_log10.toFixed(4) + '</td><td class="r num">' + v.median_fold.toFixed(2) + '</td></tr>';
+  }
+
+  function methodPanelHtml() {
+    var s = null;
+    DATA.validation.forEach(function (v) { if (v.id === 'S') s = v; });
+    var wf = DATA.walk_forward;
+    var ex = DATA.extras;
+    var offLo = Math.exp(-M.cat_offset_cap).toFixed(2);
+    var offHi = Math.exp(M.cat_offset_cap).toFixed(2);
+    var html = '<h2>Method &amp; validation</h2>' +
+      '<div class="formula"><div class="eq">implied = exp(' + DATA.ols.intercept + ') &times; TVL<sup>' + DATA.ols.slope + '</sup> &times; offset &times; growth &times; maturity</div>' +
+      '<p>Power law fitted by OLS on ln(cap) over ln(TVL) across the ' + DATA.comps_size + ' traded comps. Category offset &times;' + offLo + '–&times;' + offHi + ' (median log multiple shrunk k=' + M.cat_offset_k + ', clamped &plusmn;' + M.cat_offset_cap + '). Growth: 7d TVL change at weight ' + M.growth_weight + ', clamped −60%..+120%. Maturity: &times;' + M.maturity_floor + ' at listing rising to &times;1.00 over 3 years without a token.</p></div>' +
+      '<div class="vsum">' +
+      '<p><b>Leave-one-out:</b> radar-2 scores <b>' + s.mean_log10.toFixed(4) + '</b> mean |log10 err|, median fold <b>' + s.median_fold.toFixed(2) + '</b> — best of 10 candidates on the ' + ex.n + ' comps.</p>' +
+      '<p><b>Walk-forward:</b> fit to ' + wf[0].cutoff + ' &rarr; <b>' + wf[0].radar2_mean_log10.toFixed(4) + '</b> on the ' + wf[0].n_test + ' newer comps (flat ' + wf[0].flat_mean_log10.toFixed(4) + '); fit to ' + wf[1].cutoff + ' &rarr; <b>' + wf[1].radar2_mean_log10.toFixed(4) + '</b> on ' + wf[1].n_test + ' (flat ' + wf[1].flat_mean_log10.toFixed(4) + ').</p>' +
+      '<p><b>Hit rate:</b> ' + fmtPct(ex.within_3x_pct) + ' of held-out caps within 3x of actual, ' + fmtPct(ex.within_10x_pct) + ' within 10x.</p>' +
+      '<p><b>Band audit:</b> the printed p25–p75 band held ' + fmtPct(ex.band_p25_p75_pct) + ' of held-out caps (p10–p90: ' + fmtPct(ex.band_p10_p90_pct) + '). The bands are fitted in-sample and under-cover out of sample — read the range as optimistic.</p>' +
+      '<p><b>Rank ranges:</b> p10–p90 across ' + DATA.bootstrap.refits + ' bootstrap refits of the comp set.</p>' +
+      '</div>' +
+      '<h3 style="margin-top:12px">Leave-one-out, all candidates</h3>' +
+      '<table><thead><tr><th>Candidate</th><th class="r">Mean err</th><th class="r">Med fold</th></tr></thead><tbody>' +
+      DATA.validation.map(looRow).join('') +
+      '</tbody></table>' +
+      '<h3 style="margin-top:10px">Growth-weight grid (candidate G)</h3>' +
+      '<table><thead><tr><th>Weight</th><th class="r">Mean err</th><th class="r">Med fold</th></tr></thead><tbody>' +
+      DATA.growth_grid.map(function (g) {
+        return '<tr><td class="num">' + g.w + '</td><td class="r num">' + g.mean_log10.toFixed(4) + '</td><td class="r num">' + g.median_fold.toFixed(2) + '</td></tr>';
+      }).join('') +
+      '</tbody></table>' +
+      '<p class="note" style="margin-top:8px">Category multiples alone lose (rows C–G): categories are thin and their multiples span three orders of magnitude. The power law is the base; the offset, growth and maturity terms earn only what the table above supports.</p>';
     return html;
   }
 
-  function renderControls() {
-    var cats = [], chains = [], seenC = {}, seenH = {};
-    DATA.rows.forEach(function (r) {
-      if (r.category && !seenC[r.category]) { seenC[r.category] = 1; cats.push(r.category); }
-      r.chains.forEach(function (c) { if (!seenH[c]) { seenH[c] = 1; chains.push(c); } });
+  function quantileOf(xs, q) {
+    var s = xs.slice().sort(function (a, b) { return a - b; });
+    if (s.length === 1) return s[0];
+    var at = (s.length - 1) * q, lo = Math.floor(at), hi = Math.ceil(at);
+    return lo === hi ? s[lo] : s[lo] + (s[hi] - s[lo]) * (at - lo);
+  }
+
+  function scatterSvg() {
+    var W = 720, H = 350, L = 56, R = 12, T = 10, B = 32;
+    var xMin = Math.log(4e6), xMax = Math.log(4e10), yMin = Math.log(8e5), yMax = Math.log(4e10);
+    function X(v) { return L + (Math.log(v) - xMin) / (xMax - xMin) * (W - L - R); }
+    function Y(v) { return T + (yMax - Math.log(v)) / (yMax - yMin) * (H - T - B); }
+    var a = DATA.ols.intercept, b = DATA.ols.slope;
+    var resid = DATA.live.map(function (c) { return Math.log(c.mcap_usd / (Math.exp(a) * Math.pow(c.tvl_usd, b))); });
+    var p25 = quantileOf(resid, 0.25), p75 = quantileOf(resid, 0.75);
+    var out = '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" role="img" aria-label="Scatter of value against TVL">';
+    [1e7, 1e8, 1e9, 1e10].forEach(function (g) {
+      out += '<line x1="' + X(g) + '" y1="' + T + '" x2="' + X(g) + '" y2="' + (H - B) + '" stroke="#EFE8D4"/>' +
+        '<text x="' + X(g) + '" y="' + (H - B + 16) + '" font-size="10" fill="#5E6E64" text-anchor="middle">' + fmtUsd(g) + '</text>' +
+        '<line x1="' + L + '" y1="' + Y(g) + '" x2="' + (W - R) + '" y2="' + Y(g) + '" stroke="#EFE8D4"/>' +
+        '<text x="' + (L - 5) + '" y="' + (Y(g) + 3) + '" font-size="10" fill="#5E6E64" text-anchor="end">' + fmtUsd(g) + '</text>';
     });
-    cats.sort(); chains.sort();
-    return '<div class="controls">' +
-      '<div class="field"><label for="f-q">Search</label><input id="f-q" type="search" placeholder="Protocol, slug, category" value="' + esc(state.q) + '"></div>' +
-      '<div class="field"><label for="f-cat">Category</label><select id="f-cat">' + optionList(cats, state.category, 'All categories') + '</select></div>' +
-      '<div class="field"><label for="f-chain">Chain</label><select id="f-chain">' + optionList(chains, state.chain, 'All chains') + '</select></div>' +
-      '<div class="field"><label for="f-sort">Sort by</label><select id="f-sort">' +
-      [['implied', 'Implied value'], ['tvl', 'TVL'], ['growth', '7d growth'], ['youngest', 'Youngest first']].map(function (o) {
-        return '<option value="' + o[0] + '"' + (state.sort === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
-      }).join('') + '</select></div>' +
-      '<label class="check"><input id="f-watch" type="checkbox"' + (state.watchlistOnly ? ' checked' : '') + '> Watchlist only</label>' +
-      '<div class="count" id="result-count"></div></div>';
+    // residual band polygon around the fitted power law
+    var top = '', bot = '';
+    for (var i = 0; i <= 40; i++) {
+      var tvl = Math.exp(xMin + (xMax - xMin) * i / 40);
+      var base = Math.exp(a) * Math.pow(tvl, b);
+      top += (i === 0 ? 'M' : 'L') + X(tvl).toFixed(1) + ',' + Y(base * Math.exp(p75)).toFixed(1) + ' ';
+      bot = 'L' + X(tvl).toFixed(1) + ',' + Y(base * Math.exp(p25)).toFixed(1) + ' ' + bot;
+    }
+    out += '<path d="' + top + bot + 'Z" fill="#0C2B23" opacity="0.08"/>';
+    var line = '';
+    for (var j = 0; j <= 40; j++) {
+      var t2 = Math.exp(xMin + (xMax - xMin) * j / 40);
+      line += (j === 0 ? 'M' : 'L') + X(t2).toFixed(1) + ',' + Y(Math.exp(a) * Math.pow(t2, b)).toFixed(1) + ' ';
+    }
+    out += '<path d="' + line + '" fill="none" stroke="#0C2B23" stroke-width="1.6"/>';
+    DATA.rows.forEach(function (r) {
+      out += '<circle cx="' + X(r.tvl_usd).toFixed(1) + '" cy="' + Y(r.implied_value_usd).toFixed(1) + '" r="2.6" fill="#E8A33D" opacity="0.85"/>';
+    });
+    DATA.live.forEach(function (c) {
+      out += '<circle cx="' + X(c.tvl_usd).toFixed(1) + '" cy="' + Y(c.mcap_usd).toFixed(1) + '" r="2.6" fill="#0C2B23" opacity="0.7"/>';
+    });
+    out += '<text x="' + (W - R) + '" y="' + (H - 4) + '" font-size="10.5" fill="#5E6E64" text-anchor="end">TVL (log scale)</text>' +
+      '<text x="' + L + '" y="' + (H - 4) + '" font-size="10.5" fill="#5E6E64">value: actual cap for comps, implied for the board</text></svg>';
+    return out;
   }
 
-  var SHORT_LABEL = {
-    A: 'Flat TVL x 0.25', B: 'Global median multiple', C: 'Category median', D: 'Category shrunk k=4',
-    E: 'D x growth', F: 'D x growth x maturity', G: 'F, growth weight tuned', R1: 'radar-1 (starter model)',
-    H: 'Power law only', S: 'radar-2, as shipped'
-  };
-
-  function renderMethod() {
-    var val = DATA.validation.map(function (v) {
-      return '<tr class="' + (v.winner ? 'winner' : '') + '"><td>' + v.id + '</td><td>' + esc(SHORT_LABEL[v.id] || v.label) +
-        (v.winner ? ' <span class="tag">shipped</span>' : '') + '</td><td class="n">' + v.mean_log10.toFixed(4) +
-        '</td><td class="n">' + v.median_fold.toFixed(2) + 'x</td></tr>';
+  function wideHtml() {
+    var p = DATA.partition;
+    var wfRows = DATA.walk_forward.map(function (r) {
+      return '<tr><td class="num">' + esc(r.cutoff) + '</td><td class="r num">' + r.n_train + '</td><td class="r num">' + r.n_test + '</td>' +
+        '<td class="r num"><b>' + r.radar2_mean_log10.toFixed(4) + '</b></td><td class="r num">' + r.radar2_median_fold.toFixed(2) + '</td>' +
+        '<td class="r num">' + r.flat_mean_log10.toFixed(4) + '</td></tr>';
     }).join('');
-    var cats = DATA.categories.slice(0, 8).map(function (c) {
-      return '<tr><td>' + esc(c.category) + '</td><td class="n">' + c.n + '</td><td class="n">' + c.median.toFixed(3) +
-        '</td><td class="n">' + c.shrunk.toFixed(3) + '</td></tr>';
+    var partRows = [
+      ['Ranked on this board', p.ranked],
+      ['Already trading — the calibration comps', p.trading],
+      ['Sub-products of traded tokens (token fields, no cap recorded)', p.sub_products],
+      ['Token recorded, market cap $0', p.zero_cap],
+      ['Market cap recorded as a −$1 sentinel (autofinance)', p.sentinel_cap],
+      ['Exchanges (CEX category)', p.exchanges],
+      ['Versioned pools of another entry', p.versioned],
+      ['Staking-receipt products, set aside', p.staking_products],
+      ['Bridge products, set aside', p.bridge_products],
+      ['Named wrapped products, set aside', p.named_products],
+      ['Stand-alone but below the $5M board floor', p.unranked_small],
+    ].map(function (kv) { return '<tr><td>' + kv[0] + '</td><td class="r num">' + kv[1] + '</td></tr>'; }).join('') +
+      '<tr><td><b>Total — the whole snapshot</b></td><td class="r num"><b>' + p.total + '</b></td></tr>';
+    var costRows = DATA.chain_costs.map(function (c) {
+      return '<tr><td>' + esc(c.label) + '</td><td class="r num">$' + c.usd.toFixed(2) + '</td></tr>';
     }).join('');
-    return '<aside class="panel" id="method"><h2>Method &amp; validation</h2>' +
-      '<div class="formula">implied = exp(a) x TVL<sup>b</sup> x category offset x growth x maturity<br>' +
-      'a = <b>' + DATA.ols.intercept.toFixed(4) + '</b> · b = <b>' + DATA.ols.slope.toFixed(4) + '</b> · fit on <b>' + DATA.comps_size + '</b> live-token comps<br>' +
-      'category offset x<b>0.71-1.42</b> (log-shrunk, k=8, clamp +/-0.35)<br>' +
-      'growth x(1 + clamp(7d%, -60..120)/100 x <b>0.25</b>)<br>' +
-      'maturity x<b>0.85-1.00</b> by years without a token</div>' +
-      '<h3>Leave-one-out on the live comps</h3>' +
-      '<table><thead><tr><th></th><th>Candidate model</th><th class="n">mean |log10 err|</th><th class="n">median fold</th></tr></thead><tbody>' + val + '</tbody></table>' +
-      '<p class="note">Each candidate was fitted on 127 comps and used to predict the held-out one\'s real market cap, for all ' + DATA.comps_size + ' comps. <b>radar-2 is the lowest-error model measured</b> - the flat 0.25 multiple and every category-median model score worse, so their weights were tuned down or dropped, not kept on faith.</p>' +
-      '<h3>Category multiples (context)</h3>' +
-      '<table><thead><tr><th>Category</th><th class="n">comps</th><th class="n">median x</th><th class="n">shrunk x</th></tr></thead><tbody>' + cats + '</tbody></table>' +
-      '<p class="note">Full table below. Categories are thin - the board\'s biggest, Risk Curators, has 1 live comp - which is why a category only moves a value through the shrunk, clamped offset, never as a raw multiple.</p>' +
-      '<h3>Board rule</h3>' +
-      '<p class="note">All <b>' + DATA.watchlist_size + ' watchlist</b> protocols, plus every rankable pre-token protocol below the $50M watchlist floor down to $10M TVL: <b>' + DATA.board_size + ' rows</b>. Above the floor, only the watchlist is ranked - the rest there are wrapped, staked or bridged products of tokens that already trade, or exchanges.</p>' +
-      '</aside>';
+    var catRows = DATA.categories.map(function (c) {
+      return '<tr><td>' + esc(c.category) + '</td><td class="r num">' + c.n + '</td><td class="r num">' + fmtMult(c.median) + '</td>' +
+        '<td class="r num"><b>' + fmtMult(c.offset) + '</b></td><td class="r num">' + fmtMult(c.p25) + '</td><td class="r num">' + fmtMult(c.p75) + '</td></tr>';
+    }).join('');
+    var compRows = DATA.live.map(function (c) {
+      return '<tr><td><span class="pname">' + esc(c.name) + '</span></td><td>' + esc(c.category || 'Uncategorised') + '</td>' +
+        '<td class="r num">' + fmtUsd(c.tvl_usd) + '</td><td class="r num">' + fmtUsd(c.mcap_usd) + '</td>' +
+        '<td class="r num">' + fmtMult(c.mcap_usd / c.tvl_usd) + '</td></tr>';
+    }).join('');
+    return '<h2>Method in full</h2>' +
+      '<div class="wide-grid3">' +
+      '<div><h3>Walk-forward validation</h3><table><thead><tr><th>Fit up to</th><th class="r">Train</th><th class="r">Test</th><th class="r">radar-2</th><th class="r">Fold</th><th class="r">Flat 0.25</th></tr></thead><tbody>' + wfRows + '</tbody></table>' +
+      '<p class="note">Fit on the older comps only, scored on the newer ones — the closest test to pricing a future launch. radar-2 beats the flat baseline at both cutoffs.</p></div>' +
+      '<div><h3>Every protocol accounted for</h3><table><tbody>' + partRows + '</tbody></table>' +
+      '<p class="note">One standard on both sides of the floor: ranked means the snapshot records no token and the protocol is not an exchange, a versioned pool, or a wrapped, staked or bridged product of a traded asset. The three named products (the YBTC family, Chain Fusion, USDCx) are corrected in code with reasons, because the category field alone does not mark them.</p></div>' +
+      '<div><h3>Farm economics — the stated scenario</h3>' +
+      '<p class="note" style="color:var(--ink);font-size:12.5px">One position of <b>' + fmtFull(A.deposit_usd) + '</b> per protocol, held <b>' + A.horizon_days + ' days</b>. A launch is assumed to distribute <b>' + Math.round(A.drop_share * 100) + '% of implied value</b> pro-rata across current TVL; the position\'s slice is that share of its deposit. Fees are the plan\'s transactions at the cheapest chain the protocol lists (table below, November 2026 estimates). Forgone yield: ' + fmtFull(A.deposit_usd) + ' at ' + Math.round(A.forgone_rate * 100) + '% a year = <b>' + fmtMoney2(A.forgone_usd) + '</b>. Net = slice − fees − forgone; break-even = (fees + forgone) / slice.</p>' +
+      '<p class="note" style="color:var(--ink);font-size:12.5px;margin-top:6px">Verdict rule for unresearched rows: break-even &le;10% FARM, &le;33% THIN, above that SKIP — and FARM also requires a verified live program, so unresearched rows cap at THIN. The 40 watchlist verdicts come from verified program research dated 2026-11-18, named in each detail view, with the same scenario arithmetic printed beside them.</p>' +
+      '<table style="margin-top:6px"><thead><tr><th>Chain cost per transaction</th><th class="r">USD</th></tr></thead><tbody>' + costRows + '</tbody></table></div>' +
+      '</div>' +
+      '<div class="wide-grid" style="margin-top:16px">' +
+      '<div><h3>Value against TVL</h3><div class="scatter-box">' + scatterSvg() + '</div>' +
+      '<p class="legend">The fitted power law and its p25–p75 residual band.<span class="dot" style="background:#0C2B23"></span>' + DATA.comps_size + ' traded comps at their actual caps<span class="dot" style="background:#E8A33D"></span>' + DATA.board_size + ' board protocols at their implied values. Caps grow slower than TVL (slope ' + DATA.ols.slope + '), so implied multiples fall as protocols grow.</p></div>' +
+      '<div><h3>Category offsets actually used</h3><div class="scrollbox"><table><thead><tr><th>Category</th><th class="r">Comps</th><th class="r">Median x</th><th class="r">Offset used</th><th class="r">p25</th><th class="r">p75</th></tr></thead><tbody>' + catRows + '</tbody></table></div>' +
+      '<p class="note">The offset column is the multiplier radar-2 applies — the category median log multiple shrunk k=' + M.cat_offset_k + ' toward the global median and clamped to &times;' + Math.exp(-M.cat_offset_cap).toFixed(2) + '–&times;' + Math.exp(M.cat_offset_cap).toFixed(2) + '. The raw median is context only.</p></div>' +
+      '</div>' +
+      '<h3 style="margin-top:16px">The calibration set — all ' + DATA.comps_size + ' traded comps</h3>' +
+      '<div class="scrollbox"><table><thead><tr><th>Protocol</th><th>Category</th><th class="r">TVL</th><th class="r">Market cap</th><th class="r">Actual x</th></tr></thead><tbody>' + compRows + '</tbody></table></div>' +
+      '<div class="honest" style="margin-top:14px"><h3>What this board is not</h3>' +
+      '<p>Implied value is a calibration against protocols that already trade, not a price prediction: the model\'s own held-out median error is a ' + DATA.validation.filter(function (v) { return v.id === 'S'; })[0].median_fold.toFixed(2) + 'x fold, and the printed band under-covers out of sample (see the audit in the method panel).</p>' +
+      '<p>Six watchlist protocols already have tokens in reality — USDD, Bittensor dTAO, Plume Vaults, Doppler Finance, Mezo Earn and Hive Protocol. They stay on the board because the watchlist is the floor; their detail views say the token exists and their verdict is SKIP.</p>' +
+      '<p>The farm scenario is accounting under stated assumptions, not a forecast of any launch, and the break-even figure is a threshold to compare rows by — not an estimated probability. Programs were verified on 2026-11-18 and change fast; re-check a protocol\'s official channels before depositing anything.</p></div>';
   }
 
-  function renderBoard() {
-    var rows = applyFilters();
-    var top = DATA.rows.length ? DATA.rows[0].implied_value_usd : 1;
-    var body = rows.map(function (row) {
-      var pct = Math.max(2, Math.round((row.implied_value_usd / top) * 100));
-      return '<tr class="clickable" data-slug="' + esc(row.slug) + '">' +
-        '<td class="n">' + row.rank + '</td>' +
-        '<td class="proto"><b>' + esc(row.name) + '</b>' +
-        (row.watchlist ? ' <span class="tag">watchlist</span>' : '') + '</td>' +
-        '<td>' + esc(row.category || 'n/a') + '</td>' +
-        '<td class="proto">' + esc((row.chains[0] || 'n/a') + (row.chains.length > 1 ? ' +' + (row.chains.length - 1) : '')) + '</td>' +
-        '<td class="n">' + fmtUsd(row.tvl_usd) + '</td>' +
-        '<td class="n ' + (row.change_7d === null ? '' : row.change_7d >= 0 ? 'pos' : 'neg') + '">' + fmtPct(row.change_7d) + '</td>' +
-        '<td class="n"><b>' + fmtUsd(row.implied_value_usd) + '</b> <span class="bar"><i style="width:' + pct + '%"></i></span></td>' +
-        '<td class="n">' + fmtMult(row.eff_multiple) + '</td>' +
-        '<td class="n">' + fmtUsd(row.range_lo) + '–' + fmtUsd(row.range_hi) + '</td></tr>';
-    }).join('');
-    if (!rows.length) body = '<tr><td colspan="9">No protocol matches these filters. Clear the search or pick another category or chain.</td></tr>';
-    return '<section class="panel"><h2>The board — pre-token, ranked by implied value</h2>' +
-      '<div class="boardwrap"><table class="boardtable"><thead><tr>' +
-      '<th class="n">#</th><th>Protocol</th><th>Category</th><th>Chains</th><th class="n">TVL</th><th class="n">7d</th>' +
-      '<th class="n">Implied value</th><th class="n">x TVL</th><th class="n">Range</th></tr></thead><tbody>' + body + '</tbody></table></div>' +
-      '<p class="note">Click any row for its model breakdown and farm plan. Range is the model\'s own p25-p75 error band on its live comps.</p></section>';
+  function renderBoardPage() {
+    var cats = categoriesPresent();
+    var below = DATA.rows.filter(function (r) { return r.tvl_usd < DATA.floor_usd; });
+    var credited = below.filter(function (r) { return r.change_7d !== null && r.change_7d <= 120; });
+    var mover = credited.slice().sort(function (a, b) { return b.change_7d - a.change_7d; })[0];
+    var early = 'Early radar: ' + below.length + ' of the ' + DATA.board_size + ' rows sit below the ' + fmtUsd(DATA.floor_usd) + ' watchlist floor' +
+      (mover ? ' &middot; top 7d mover down there: ' + esc(mover.name) + ' ' + (mover.change_7d > 0 ? '+' : '') + mover.change_7d.toFixed(1) + '%' : '');
+    app.innerHTML = '<div class="shell">' + headerHtml() + stripHtml() +
+      '<section class="controls">' +
+      '<input id="q" type="search" placeholder="Search name, category, chain or slug" autocomplete="off">' +
+      '<select id="catSel" aria-label="Category"><option value="">All categories</option>' +
+      cats.map(function (c) { return '<option' + (state.cat === c ? ' selected' : '') + '>' + esc(c) + '</option>'; }).join('') + '</select>' +
+      '<select id="verdictSel" aria-label="Verdict"><option value="">All verdicts</option>' +
+      ['FARM', 'THIN', 'SKIP'].map(function (v) { return '<option value="' + v + '"' + (state.verdict === v ? ' selected' : '') + '>' + v + '</option>'; }).join('') + '</select>' +
+      '<label class="chk"><input id="wlOnly" type="checkbox"' + (state.wl ? ' checked' : '') + '> Watchlist only</label>' +
+      '<select id="sortSel" aria-label="Sort">' +
+      [['rank', 'Sort: radar rank'], ['implied', 'Sort: implied value'], ['net', 'Sort: farm net'], ['hour', 'Sort: farm $/hour'], ['tvl', 'Sort: TVL'], ['growth', 'Sort: 7d growth'], ['young', 'Sort: youngest first']]
+        .map(function (kv) { return '<option value="' + kv[0] + '"' + (state.sort === kv[0] ? ' selected' : '') + '>' + kv[1] + '</option>'; }).join('') + '</select>' +
+      '<span class="count" id="countLine"></span></section>' +
+      '<main class="grid"><aside class="panel method">' + methodPanelHtml() + '</aside>' +
+      '<section class="panel board"><div class="board-head" style="display:flex;justify-content:space-between;gap:12px;align-items:baseline;flex-wrap:wrap"><h2>Pre-token board</h2><span class="note">' + early + '</span></div>' +
+      '<p class="note" style="margin:4px 0 8px">Ranked: the snapshot records no token, and the protocol is not an exchange, a versioned pool, or a wrapped, staked or bridged product of a traded asset — one standard above and below the ' + fmtUsd(DATA.floor_usd) + ' watchlist floor, down to the snapshot\'s own $5M floor. Range is the model\'s p25–p75 error band; rank range is the bootstrap p10–p90. Verdicts come from verified program research, shown in each protocol\'s detail view — not from the scenario arithmetic: the standardised $1,000 scenario net printed with each verdict can be negative where fees dominate at that size. Click a row for the full detail.</p>' +
+      '<div class="table-wrap"><table><thead id="boardHead"></thead><tbody id="boardBody"></tbody></table></div></section></main>' +
+      '<section class="panel wide">' + wideHtml() + '</section>' +
+      footerHtml() + '</div>';
+    app.removeAttribute('aria-busy');
+    var q = document.getElementById('q');
+    q.value = state.q;
+    q.addEventListener('input', function () { state.q = q.value; syncUrl(); renderRows(); });
+    var catSel = document.getElementById('catSel');
+    catSel.addEventListener('change', function () { state.cat = catSel.value; syncUrl(); renderRows(); });
+    var verdictSel = document.getElementById('verdictSel');
+    verdictSel.addEventListener('change', function () { state.verdict = verdictSel.value; syncUrl(); renderRows(); });
+    var wlOnly = document.getElementById('wlOnly');
+    wlOnly.addEventListener('change', function () { state.wl = wlOnly.checked; syncUrl(); renderRows(); });
+    var sortSel = document.getElementById('sortSel');
+    sortSel.addEventListener('change', function () { state.sort = sortSel.value; syncUrl(); renderRows(); });
+    document.getElementById('boardBody').addEventListener('click', function (ev) {
+      var tr = ev.target.closest('tr[data-slug]');
+      if (tr) location.href = './index.html?detail=' + encodeURIComponent(tr.getAttribute('data-slug'));
+    });
+    renderRows();
   }
 
-  function renderLive() {
-    var body = DATA.live.map(function (p) {
-      var mult = p.mcap_usd && p.tvl_usd ? p.mcap_usd / p.tvl_usd : null;
-      return '<tr><td><b>' + esc(p.name) + '</b></td><td>' + esc(p.category || 'n/a') + '</td>' +
-        '<td class="n">' + fmtUsd(p.tvl_usd) + '</td><td class="n">' + fmtUsd(p.mcap_usd) + '</td>' +
-        '<td class="n">' + (mult === null ? 'n/a' : mult.toFixed(3) + 'x') + '</td>' +
-        '<td class="n ' + (p.change_7d === null ? '' : p.change_7d >= 0 ? 'pos' : 'neg') + '">' + fmtPct(p.change_7d) + '</td></tr>';
-    }).join('');
-    return '<section class="panel wide"><h2>Calibration set — live tokens, never ranked</h2>' +
-      '<p class="note" style="margin:0 0 8px">These protocols already trade. The board never ranks them; radar-2 is fitted on their real market caps (the top ' + DATA.live_size + ' of ' + DATA.comps_size + ' comps shown), and the leave-one-out table above is scored on them.</p>' +
-      '<div class="boardwrap"><table><thead><tr><th>Protocol</th><th>Category</th><th class="n">TVL</th><th class="n">Market cap</th><th class="n">Actual x TVL</th><th class="n">7d</th></tr></thead><tbody>' + body + '</tbody></table></div></section>';
+  // ---------- detail page ----------
+  function peersFor(row) {
+    return DATA.live
+      .filter(function (c) { return (c.category || '') === (row.category || ''); })
+      .map(function (c) { return { c: c, d: Math.abs(Math.log(c.tvl_usd / row.tvl_usd)) }; })
+      .sort(function (a, b) { return a.d - b.d; })
+      .slice(0, 3)
+      .map(function (x) { return x.c; });
   }
 
-  function renderCategories() {
-    var body = DATA.categories.map(function (c) {
-      return '<tr><td>' + esc(c.category) + '</td><td class="n">' + c.n + '</td><td class="n">' + c.median.toFixed(4) +
-        '</td><td class="n">' + c.shrunk.toFixed(4) + '</td><td class="n">' + c.p25.toFixed(4) + '</td><td class="n">' + c.p75.toFixed(4) + '</td></tr>';
-    }).join('');
-    return '<section class="panel wide"><h2>Category multiples — every category with a live comp</h2>' +
-      '<div class="boardwrap"><table><thead><tr><th>Category</th><th class="n">Live comps</th><th class="n">Median mcap/TVL</th><th class="n">Shrunk (k=4)</th><th class="n">p25</th><th class="n">p75</th></tr></thead><tbody>' + body + '</tbody></table></div></section>';
+  function kvCell(k, v) {
+    return '<div class="cell"><div class="k">' + k + '</div><div class="v">' + v + '</div></div>';
   }
 
-  function renderDetail(row) {
-    var panel = document.getElementById('detail');
-    if (!row) { panel.hidden = true; panel.innerHTML = ''; return; }
-    var cat = calibratedMultiple(row.category);
-    var steps = farmPlanFor(row).map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('');
-    var eq = impliedValueBreakdown(row).map(function (pair, i, all) {
-      return '<div class="' + (i === all.length - 1 ? 'total' : '') + '"><span>' + esc(pair[0]) + '</span><span>' + esc(pair[1]) + '</span></div>';
-    }).join('');
-    panel.innerHTML =
-      '<div class="detail-head"><div><div class="kicker" style="font-family:var(--num);font-size:11px;letter-spacing:.12em;color:var(--amberink)">' +
-      esc(row.category || 'Uncategorised') + ' · rank #' + row.rank + (row.watchlist ? ' · <span class="tag">watchlist</span>' : '') + '</div>' +
-      '<h2>' + esc(row.name) + '</h2><div class="sub">' + esc(row.slug) + ' · ' + esc(row.chains.join(', ') || 'no chain listed') + '</div></div>' +
-      '<button class="close" id="d-close" aria-label="Close detail">Close</button></div>' +
+  function renderDetailPage() {
+    var row = rowsBySlug[state.detail];
+    if (!row) { renderBoardPage(); return; }
+    var e = row.econ;
+    var researched = row.farm_source !== null;
+    var base = row.tvl_usd * row.base_multiple;
+    var peers = peersFor(row);
+    var peerRows = peers.length
+      ? peers.map(function (c) {
+          return '<tr><td><span class="pname">' + esc(c.name) + '</span></td><td class="r num">' + fmtUsd(c.tvl_usd) + '</td>' +
+            '<td class="r num">' + fmtUsd(c.mcap_usd) + '</td><td class="r num">' + fmtMult(c.mcap_usd / c.tvl_usd) + '</td></tr>';
+        }).join('')
+      : '<tr><td colspan="4" class="sub">No traded comp shares this category — the model uses the global median offset for it.</td></tr>';
+    var bannerText = researched
+      ? 'Program: <b>' + esc(row.farm_program) + '</b>. The verdict comes from verified program research (source below), not from the scenario arithmetic — the standardised $1,000 scenario is printed beside it, unchanged, so the two can be compared.'
+      : 'No verified points program is recorded for this protocol. The verdict comes from the stated odds rule: break-even &le;10% would be FARM, &le;33% THIN, above that SKIP — and FARM also requires a verified live program, which this protocol does not have.';
+    // A break-even above 100% is not an odds figure a reader can act on: say plainly that the
+    // costs exceed the slice at this size instead of printing a percentage over 100.
+    var breakevenCell = e.breakeven_pct === null ? '<td class="r num">n/a</td>'
+      : e.breakeven_pct > 100 ? '<td class="r">not reachable at this size — fees + forgone yield exceed the scenario slice</td>'
+      : '<td class="r num">' + fmtPct(e.breakeven_pct) + '</td>';
+    var html = '<div class="shell detail">' + headerHtml(true) +
+      '<p style="margin-top:5px"><a class="back" href="./index.html">&larr; Back to the board</a></p>' +
+      '<section class="panel">' +
+      '<div class="detail-head"><div><h2 style="font-size:18px">' + esc(row.name) + (row.watchlist ? '<span class="tag">WATCHLIST</span>' : '') + '</h2>' +
+      '<span class="slug">' + esc(row.slug) + ' &middot; ' + esc(row.category || 'Uncategorised') + ' &middot; ' + esc(row.chains.join(', ') || 'no chains listed') + '</span></div>' +
+      '<div style="text-align:right"><div class="sub">Radar rank</div><div style="font-size:18px;font-weight:800">#' + row.rank + ' <small style="font-size:12px;color:var(--muted)">of ' + DATA.board_size + '</small></div></div></div>' +
+      '<div class="banner ' + row.verdict + '"><div class="big">' + row.verdict + '</div><p>' + bannerText + '</p></div>' +
       '<div class="kv">' +
-      '<div><span>TVL</span><b class="num">' + fmtFullUsd(row.tvl_usd) + '</b></div>' +
-      '<div><span>7d change</span><b class="num">' + fmtPct(row.change_7d) + '</b></div>' +
-      '<div><span>Listed on DefiLlama</span><b class="num">' + esc(row.listed_at || 'unreported') + '</b></div>' +
-      '<div><span>Without a token</span><b class="num">' + (row.age_days === null ? 'unreported' : row.age_days + ' days') + '</b></div>' +
-      '<div><span>Implied value</span><b class="num">' + fmtFullUsd(row.implied_value_usd) + '</b></div>' +
-      '<div><span>Range (p25-p75)</span><b class="num">' + fmtUsd(row.range_lo) + ' – ' + fmtUsd(row.range_hi) + '</b></div></div>' +
-      '<h3 style="margin-top:16px">How radar-2 prices it</h3><div class="eq">' + eq + '</div>' +
-      '<p class="note">Category context: ' + esc(row.category || 'this category') + ' has ' + row.cat_n + ' live comp' + (row.cat_n === 1 ? '' : 's') +
-      (cat ? ', median multiple ' + cat.median.toFixed(3) + 'x, shrunk ' + cat.shrunk.toFixed(3) + 'x' : '') +
-      '. The category moves the value only through the shrunk, clamped offset above - on purpose: raw category multiples measured worse in leave-one-out.</p>' +
-      '<h3 style="margin-top:16px">Farm plan</h3><ol class="steps">' + steps + '</ol>' +
-      '<div class="honest">' + esc(row.name) + ' records no token in this snapshot. The implied value is this model\'s claim from the snapshot\'s own figures - it is not a prediction that a launch will happen, or when.</div>';
-    panel.hidden = false;
-    document.getElementById('d-close').addEventListener('click', function () { renderDetail(null); });
+      kvCell('Implied value', fmtFull(row.implied_value_usd)) +
+      kvCell('TVL', fmtFull(row.tvl_usd)) +
+      kvCell('Effective multiple', fmtMult(row.eff_multiple)) +
+      kvCell('7d TVL change', (row.change_7d === null ? 'n/a' : (row.change_7d > 0 ? '+' : '') + row.change_7d.toFixed(1) + '%')) +
+      kvCell('Range (p25–p75)', fmtUsd(row.range_lo) + ' – ' + fmtUsd(row.range_hi)) +
+      kvCell('Rank range (bootstrap)', '#' + row.rank_lo + ' – #' + row.rank_hi) +
+      kvCell('Age without a token', fmtAge(row.age_days) + (row.listed_at ? ' <small>since ' + esc(row.listed_at) + '</small>' : '')) +
+      kvCell('Scenario net', fmtMoney2(e.net_usd)) +
+      '</div>' +
+      '<div class="dgrid">' +
+      '<div><h3>How the model prices it</h3><div class="eqbox">' +
+      'power law &times; category offset = ' + fmtFull(base) + '<br>' +
+      '&times; growth ' + row.growth_multiplier.toFixed(2) + ' (7d ' + (row.change_7d === null ? 'n/a' : row.change_7d.toFixed(1) + '%') + ', weight ' + M.growth_weight + ')<br>' +
+      '&times; maturity ' + row.maturity_multiplier.toFixed(2) + ' (' + fmtAge(row.age_days) + ' without a token)<br>' +
+      '= <b>' + fmtFull(row.implied_value_usd) + '</b> implied</div>' +
+      '<p class="note">Category offset used: &times;' + row.cat_offset.toFixed(2) + ' — ' + esc(row.category || 'this category') + ' has ' + row.cat_n + ' traded comp' + (row.cat_n === 1 ? '' : 's') + (row.cat_median !== null ? ' with a median actual multiple of ' + fmtMult(row.cat_median) : '') + '. The range is the model\'s p25–p75 error band for the category' + (row.range_hi / Math.max(1, row.range_lo) > 16 ? ' — a wide band: this row\'s value is genuinely uncertain, and the rank range says the same' : '') + '. The rank range is the p10–p90 across ' + DATA.bootstrap.refits + ' bootstrap refits.</p>' +
+      '<h3 style="margin-top:7px">Nearest traded peers (same category)</h3>' +
+      '<table><thead><tr><th>Protocol</th><th class="r">TVL</th><th class="r">Market cap</th><th class="r">Actual x</th></tr></thead><tbody>' + peerRows + '</tbody></table></div>' +
+      '<div><h3>Farm economics — the stated $1,000 scenario</h3>' +
+      '<table><tbody>' +
+      '<tr><td>Deposit (scenario capital)</td><td class="r num">' + fmtFull(e.deposit_usd) + '</td></tr>' +
+      '<tr><td>Scenario slice — ' + Math.round(A.drop_share * 100) + '% of implied value, pro-rata across TVL</td><td class="r num">' + fmtMoney2(e.slice_usd) + '</td></tr>' +
+      '<tr><td>Fees — ' + e.txs + ' transactions on ' + esc(e.chain) + ' at $' + e.chain_cost_usd.toFixed(2) + '</td><td class="r num">−' + fmtMoney2(e.fees_usd) + '</td></tr>' +
+      '<tr><td>Forgone yield — ' + Math.round(A.forgone_rate * 100) + '% a year for ' + A.horizon_days + ' days</td><td class="r num">−' + fmtMoney2(e.forgone_usd) + '</td></tr>' +
+      '<tr><td><b>Net</b></td><td class="r num"><b>' + fmtMoney2(e.net_usd) + '</b></td></tr>' +
+      '<tr><td>Break-even launch odds (a threshold, not a prediction)</td>' + breakevenCell + '</tr>' +
+      '<tr><td>Net per hour of plan time (' + e.hours.toFixed(1) + ' h total)</td><td class="r num">' + fmtMoney2(e.per_hour_usd) + '</td></tr>' +
+      '</tbody></table>' +
+      '<p class="note">Fees use the cheapest chain the protocol lists in the snapshot, costed from the printed chain table (November 2026 estimates). The scenario is the same for every row so rows can be compared; a researched plan\'s own steps may use different capital, and say so.</p></div>' +
+      '</div>' +
+      '<h3 style="margin-top:8px">Farm plan</h3>' +
+      '<ol class="steps">' + row.farm_steps.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ol>' +
+      (researched ? '<p class="src">Program: ' + esc(row.farm_program) + ' &middot; Source: ' + esc(row.farm_source) + '. Verified 2026-11-18 from the protocol\'s official pages or the named report; programs change fast — re-check before depositing.</p>' : '') +
+      '</section>' + footerHtml() + '</div>';
+    app.innerHTML = html;
+    app.removeAttribute('aria-busy');
+    window.scrollTo(0, 0);
   }
 
-  function openDetail(slug) {
-    for (var i = 0; i < DATA.rows.length; i++) {
-      if (DATA.rows[i].slug === slug) { renderDetail(DATA.rows[i]); return; }
-    }
-    renderDetail(null);
-  }
-
-  // ---------- build the page ----------
-  app.removeAttribute('aria-busy');
-  app.innerHTML = '<div class="shell">' + renderHeader() + renderStats() + renderControls() +
-    '<div class="grid">' + renderMethod() + '<div id="board-slot">' + renderBoard() + '</div></div>' +
-    renderLive() + renderCategories() +
-    '<footer>Implied values are this model\'s claims from one sealed DefiLlama snapshot (' + esc(DATA.as_of) + '). Not financial advice.</footer></div>' +
-    '<div class="detail" id="detail" hidden></div>';
-
-  function refreshBoard() {
-    document.getElementById('board-slot').innerHTML = renderBoard();
-    var rows = applyFilters();
-    document.getElementById('result-count').innerHTML = 'Showing <b>' + rows.length + '</b> of ' + DATA.board_size + ' ranked protocols';
-    var trs = document.querySelectorAll('#board-slot tr.clickable');
-    for (var i = 0; i < trs.length; i++) {
-      trs[i].addEventListener('click', function () { openDetail(this.getAttribute('data-slug')); });
-    }
-  }
-  document.getElementById('f-q').addEventListener('input', function () { state.q = this.value; refreshBoard(); });
-  document.getElementById('f-cat').addEventListener('change', function () { state.category = this.value; refreshBoard(); });
-  document.getElementById('f-chain').addEventListener('change', function () { state.chain = this.value; refreshBoard(); });
-  document.getElementById('f-sort').addEventListener('change', function () { state.sort = this.value; refreshBoard(); });
-  document.getElementById('f-watch').addEventListener('change', function () { state.watchlistOnly = this.checked; refreshBoard(); });
-  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') renderDetail(null); });
-  refreshBoard();
-  if (state.detail) openDetail(state.detail);
+  if (state.detail) renderDetailPage();
+  else renderBoardPage();
 })();

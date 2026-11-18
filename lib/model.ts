@@ -34,6 +34,22 @@
 // A row's range is the shipped model's own error band: the p25-p75 of ln(actual / predicted) over
 // the live comps of the row's category (the global band when the category has fewer than 5 comps),
 // applied to the row's implied value. It is a dispersion band, not a promise.
+//
+// v2 scope (V2-SPEC section 1, AUDIT.md section 2): ONE classification standard on both sides of
+// the watchlist floor. The board carries the 40 watchlist protocols plus every other stand-alone
+// pre-token protocol the snapshot holds, down to the snapshot's own $5M floor: stand-alone means
+// the snapshot records no token for it and it is not an exchange, not a versioned pool of another
+// entry, and not a wrapped, staked or bridged product of an asset that already trades (whole
+// product categories, plus a short named correction list where the fields alone cannot see the
+// product). The partition of all 758 snapshot protocols is computed in code (classifyProtocol)
+// and printed on the dashboard, so the board's scope can be checked line by line. v2 also adds,
+// all computed at runtime from the snapshot: a two-cutoff walk-forward validation, LOO hit rates,
+// a band coverage audit, bootstrap rank ranges (200 refits, fixed seed), and per-row farm
+// economics under one stated $1,000 scenario (see ECON below). The radar-2 value model itself is
+// unchanged from v1 — same constants, same runtime refit; the tournament in research/TOURNAMENT.md
+// measured no challenger that earns a change.
+
+import { FARM_RESEARCH } from './farmdata.ts';
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -92,14 +108,16 @@ export const MODEL: RadarConstants = {
   maturity_days: 1095,
   unknown_age_days: 365,
   range_min_category_comps: 5,
-  board_floor_usd: 10_000_000,
+  // v2 board floor: the snapshot's own $5M floor (AUDIT.md fix 2.3). The value-model
+  // constants below this line are radar-2 exactly as shipped in v1 — not one retuned.
+  board_floor_usd: 5_000_000,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
 export const MODEL_VERSION = 'radar-2';
 
-/** How many live-token protocols the Live token view carries, by market cap. */
-export const LIVE_ROWS = 24;
+/** How many live-token protocols the dashboard carries: all of them (the full calibration set). */
+export const LIVE_ROWS = 128;
 
 /** One row of board.json: the ranked board's row. */
 export interface BoardRow {
@@ -127,6 +145,24 @@ export interface BoardRow {
   farm_steps: string[];
 }
 
+/** The three farm verdicts every board row carries. */
+export type Verdict = 'FARM' | 'THIN' | 'SKIP';
+
+/** One row's farm economics under the stated $1,000 scenario (see ECON in this file). */
+export interface FarmEcon {
+  deposit_usd: number;
+  slice_usd: number;
+  fees_usd: number;
+  forgone_usd: number;
+  net_usd: number;
+  breakeven_pct: number | null;
+  per_hour_usd: number;
+  hours: number;
+  txs: number;
+  chain: string;
+  chain_cost_usd: number;
+}
+
 /** The dashboard's view of one row: the board row's figures plus radar-2's range and category context. */
 export interface RadarRow {
   rank: number;
@@ -147,9 +183,15 @@ export interface RadarRow {
   cat_offset: number;
   range_lo: number;
   range_hi: number;
+  rank_lo: number;
+  rank_hi: number;
   cat_n: number;
   cat_median: number | null;
   watchlist: boolean;
+  verdict: Verdict;
+  econ: FarmEcon;
+  farm_program: string | null;
+  farm_source: string | null;
   farm_steps: string[];
 }
 
@@ -179,8 +221,45 @@ export interface CategoryRow {
   n: number;
   median: number;
   shrunk: number;
+  offset: number;
   p25: number;
   p75: number;
+}
+
+/** The classification of every protocol in the snapshot: the partition sums to the snapshot size. */
+export interface Partition {
+  ranked: number;
+  trading: number;
+  zero_cap: number;
+  sentinel_cap: number;
+  sub_products: number;
+  exchanges: number;
+  versioned: number;
+  staking_products: number;
+  bridge_products: number;
+  named_products: number;
+  unranked_small: number;
+  total: number;
+}
+
+/** One walk-forward (time-split) validation row: fit on the older comps, score the newer ones. */
+export interface WalkForwardRow {
+  cutoff: string;
+  n_train: number;
+  n_test: number;
+  radar2_mean_log10: number;
+  radar2_median_fold: number;
+  flat_mean_log10: number;
+  flat_median_fold: number;
+}
+
+/** Held-out accuracy extras: LOO hit rates and the coverage audit of the printed bands. */
+export interface ValidationExtras {
+  n: number;
+  within_3x_pct: number;
+  within_10x_pct: number;
+  band_p25_p75_pct: number;
+  band_p10_p90_pct: number;
 }
 
 /** Everything the dashboard needs: the board, the live set, the fit and the validation. */
@@ -201,6 +280,14 @@ export interface RadarData {
   validation: ValidationRow[];
   growth_grid: { w: number; mean_log10: number; median_fold: number }[];
   categories: CategoryRow[];
+  partition: Partition;
+  walk_forward: WalkForwardRow[];
+  extras: ValidationExtras;
+  coverage: number;
+  verdict_counts: { FARM: number; THIN: number; SKIP: number };
+  assumptions: { deposit_usd: number; horizon_days: number; weeks: number; drop_share: number; forgone_rate: number; forgone_usd: number };
+  chain_costs: { label: string; usd: number }[];
+  bootstrap: { refits: number; seed: number };
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -261,6 +348,90 @@ export function liveComps(snapshot: Snapshot): SnapshotProtocol[] {
   return snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
 }
 
+/** What one snapshot protocol is, for board scope: exactly one class per protocol. */
+export type ProtocolClass =
+  | 'ranked'
+  | 'trading'
+  | 'zero-cap'
+  | 'sentinel-cap'
+  | 'sub-product'
+  | 'exchange'
+  | 'versioned'
+  | 'staking-product'
+  | 'bridge-product'
+  | 'named-product'
+  | 'unranked-small';
+
+/** Whole categories that are receipts for an asset that already trades, never launch candidates. */
+const STAKING_PRODUCT_CATEGORIES: ReadonlySet<string> = new Set(['Liquid Staking', 'Liquid Restaking', 'Restaked BTC']);
+
+/** Whole categories whose product is moving an already-traded asset between chains. */
+const BRIDGE_PRODUCT_CATEGORIES: ReadonlySet<string> = new Set(['Bridge', 'Canonical Bridge', 'Cross Chain Bridge']);
+
+/**
+ * Named corrections to the field rule, each with its reason: protocols the category field alone
+ * does not mark as products of an asset that already trades (audit of the baseline entry,
+ * research/AUDIT.md section 2.2). Only these three; every other exclusion is a field rule.
+ */
+export const PRODUCT_CORRECTIONS: Record<string, string> = {
+  'bitlayer-ybtc-family': 'YBTC is a wrapped-BTC product family; the underlying BTC already trades.',
+  'chain-fusion': 'a bridged-BTC product; the underlying BTC already trades.',
+  usdcx: 'USDCx is USDC wrapped for another chain; the underlying USDC already trades.',
+};
+
+/**
+ * The one classification standard, applied on both sides of the watchlist floor: a protocol is
+ * ranked when the snapshot records no token for it and it is not an exchange, not a versioned
+ * pool, and not a wrapped, staked or bridged product of an asset that already trades.
+ */
+export function classifyProtocol(p: SnapshotProtocol): ProtocolClass {
+  if (p.mcap_usd !== null && p.mcap_usd > 0) return 'trading';
+  if (p.mcap_usd === 0) return 'zero-cap';
+  if (p.mcap_usd !== null) return 'sentinel-cap';
+  if (!isPreToken(p)) return 'sub-product';
+  if (p.category === 'CEX') return 'exchange';
+  if (VERSIONED.test(p.name)) return 'versioned';
+  if (p.category !== null && STAKING_PRODUCT_CATEGORIES.has(p.category)) return 'staking-product';
+  if (p.category !== null && BRIDGE_PRODUCT_CATEGORIES.has(p.category)) return 'bridge-product';
+  if (PRODUCT_CORRECTIONS[p.slug] !== undefined) return 'named-product';
+  if (p.tvl_usd < MODEL.board_floor_usd) return 'unranked-small';
+  return 'ranked';
+}
+
+/** The partition of the whole snapshot by class: the counts sum to the snapshot's size. */
+export function partitionOf(snapshot: Snapshot): Partition {
+  const part: Partition = {
+    ranked: 0,
+    trading: 0,
+    zero_cap: 0,
+    sentinel_cap: 0,
+    sub_products: 0,
+    exchanges: 0,
+    versioned: 0,
+    staking_products: 0,
+    bridge_products: 0,
+    named_products: 0,
+    unranked_small: 0,
+    total: snapshot.protocols.length,
+  };
+  for (const p of snapshot.protocols) {
+    switch (classifyProtocol(p)) {
+      case 'ranked': part.ranked++; break;
+      case 'trading': part.trading++; break;
+      case 'zero-cap': part.zero_cap++; break;
+      case 'sentinel-cap': part.sentinel_cap++; break;
+      case 'sub-product': part.sub_products++; break;
+      case 'exchange': part.exchanges++; break;
+      case 'versioned': part.versioned++; break;
+      case 'staking-product': part.staking_products++; break;
+      case 'bridge-product': part.bridge_products++; break;
+      case 'named-product': part.named_products++; break;
+      case 'unranked-small': part.unranked_small++; break;
+    }
+  }
+  return part;
+}
+
 /** The ordinary-least-squares fit of ln(mcap) on ln(tvl) over a set of comps. */
 export function fitOls(comps: SnapshotProtocol[]): { a: number; b: number } {
   const xs = comps.map((p) => Math.log(p.tvl_usd));
@@ -319,6 +490,35 @@ export function radarValue(p: SnapshotProtocol, asOf: string, fit: { a: number; 
   const growth = growthFactor(p);
   const maturity = maturityFactor(p, asOf);
   return { raw: base * growth * maturity, base, offset, catN: n, growth, maturity };
+}
+
+/**
+ * Per-category log offsets for a comp set, computed once: exactly categoryOffset's arithmetic
+ * (same medians, same shrinkage, same clamp), batched so the bootstrap can refit 200 times
+ * inside the runtime budget. A category with no comps in the set is absent, which callers
+ * read as offset 0 — the same answer categoryOffset gives.
+ */
+export function offsetMapFor(comps: SnapshotProtocol[]): Map<string, number> {
+  const glob = median(comps.map((q) => Math.log(q.mcap_usd! / q.tvl_usd)));
+  const by = new Map<string, number[]>();
+  for (const q of comps) {
+    const key = q.category ?? '';
+    const list = by.get(key) ?? [];
+    list.push(Math.log(q.mcap_usd! / q.tvl_usd));
+    by.set(key, list);
+  }
+  const out = new Map<string, number>();
+  for (const [key, own] of by) {
+    const shrunk = (own.length * median(own) + MODEL.cat_offset_k * glob) / (own.length + MODEL.cat_offset_k);
+    out.set(key, clamp(shrunk - glob, -MODEL.cat_offset_cap, MODEL.cat_offset_cap));
+  }
+  return out;
+}
+
+/** radarValue's raw prediction with precomputed offsets: identical arithmetic, no refit per row. */
+export function radarValueFast(p: SnapshotProtocol, asOf: string, fit: { a: number; b: number }, offsets: Map<string, number>): number {
+  const base = powerValue(p.tvl_usd, fit) * Math.exp(offsets.get(p.category ?? '') ?? 0);
+  return base * growthFactor(p) * maturityFactor(p, asOf);
 }
 
 /** The starter's growth factor, kept only so the validation can score the candidates that used it. */
@@ -418,10 +618,120 @@ export function validateModels(snapshot: Snapshot): { validation: ValidationRow[
   return { validation: rows, growth_grid };
 }
 
+/** Score a predictor over a held-out set with the two error figures the dashboard prints. */
+function splitScore(test: SnapshotProtocol[], predict: (p: SnapshotProtocol) => number): { mean_log10: number; median_fold: number } {
+  const e10: number[] = [];
+  const efold: number[] = [];
+  for (const p of test) {
+    const ratio = predict(p) / p.mcap_usd!;
+    e10.push(Math.abs(Math.log10(ratio)));
+    efold.push(Math.abs(Math.log(ratio)));
+  }
+  return {
+    mean_log10: round4(e10.reduce((s, x) => s + x, 0) / e10.length),
+    median_fold: Math.round(Math.exp(median(efold)) * 1000) / 1000,
+  };
+}
+
+/**
+ * Walk-forward validation: fit on the comps listed up to a cutoff, score the comps listed after
+ * it, at two cutoffs — the median listing date of the dated comps and 2024-07-01. radar-2 must
+ * beat the flat 0.25 baseline at both for the dashboard to print the claim, and it does; the
+ * numbers are recomputed here from the snapshot, and they match the research tournament's
+ * time-split (research/tournament/results.json) to the printed rounding.
+ */
+export function walkForward(snapshot: Snapshot): WalkForwardRow[] {
+  const comps = liveComps(snapshot);
+  const dated = comps.filter((p) => p.listed_at !== null);
+  const dates = dated.map((p) => p.listed_at!).sort();
+  const cutoffs = [dates[Math.floor(dates.length / 2)]!, '2024-07-01'];
+  const out: WalkForwardRow[] = [];
+  for (const cutoff of cutoffs) {
+    if (out.some((r) => r.cutoff === cutoff)) continue;
+    const train = dated.filter((p) => p.listed_at! <= cutoff);
+    const test = dated.filter((p) => p.listed_at! > cutoff);
+    if (train.length === 0 || test.length === 0) continue;
+    const fit = fitOls(train);
+    const r2 = splitScore(test, (p) => radarValue(p, snapshot.as_of, fit, train).raw);
+    const fl = splitScore(test, (p) => p.tvl_usd * 0.25);
+    out.push({
+      cutoff,
+      n_train: train.length,
+      n_test: test.length,
+      radar2_mean_log10: r2.mean_log10,
+      radar2_median_fold: r2.median_fold,
+      flat_mean_log10: fl.mean_log10,
+      flat_median_fold: fl.median_fold,
+    });
+  }
+  return out;
+}
+
+/**
+ * Held-out accuracy extras, all from leave-one-out predictions under the shipped model: the share
+ * of comps predicted within 3x and within 10x of their actual cap, and a coverage audit of the
+ * printed range bands — the share of held-out actual caps that fall inside the band the board
+ * prints (per category where the category has at least 5 comps, else the global band). The bands
+ * are fitted in-sample, so the audit is expected to under-cover; it is printed as a self-critique,
+ * not hidden.
+ */
+export function validationExtras(snapshot: Snapshot): ValidationExtras {
+  const comps = liveComps(snapshot);
+  const asOf = snapshot.as_of;
+  const fit = fitOls(comps);
+  const looPred = new Map<string, number>();
+  for (let i = 0; i < comps.length; i++) {
+    const others = comps.filter((_, j) => j !== i);
+    looPred.set(comps[i]!.slug, radarValue(comps[i]!, asOf, fitOls(others), others).raw);
+  }
+  let in3 = 0;
+  let in10 = 0;
+  for (const p of comps) {
+    const pred = looPred.get(p.slug)!;
+    const ratio = Math.max(pred / p.mcap_usd!, p.mcap_usd! / pred);
+    if (ratio <= 3) in3++;
+    if (ratio <= 10) in10++;
+  }
+  const residAll: number[] = [];
+  const residBy = new Map<string, number[]>();
+  for (const q of comps) {
+    const r = Math.log(q.mcap_usd! / radarValue(q, asOf, fit, comps).raw);
+    residAll.push(r);
+    const key = q.category ?? '';
+    const list = residBy.get(key) ?? [];
+    list.push(r);
+    residBy.set(key, list);
+  }
+  const bandFor = (key: string, lo: number, hi: number): [number, number] => {
+    const list = residBy.get(key);
+    const src = list !== undefined && list.length >= MODEL.range_min_category_comps ? list : residAll;
+    return [quantile(src, lo), quantile(src, hi)];
+  };
+  let inMid = 0;
+  let inWide = 0;
+  for (const p of comps) {
+    const r = Math.log(p.mcap_usd! / looPred.get(p.slug)!);
+    const key = p.category ?? '';
+    const mid = bandFor(key, 0.25, 0.75);
+    const wide = bandFor(key, 0.1, 0.9);
+    if (r >= mid[0] && r <= mid[1]) inMid++;
+    if (r >= wide[0] && r <= wide[1]) inWide++;
+  }
+  const pct = (x: number): number => Math.round((x / comps.length) * 1000) / 10;
+  return {
+    n: comps.length,
+    within_3x_pct: pct(in3),
+    within_10x_pct: pct(in10),
+    band_p25_p75_pct: pct(inMid),
+    band_p10_p90_pct: pct(inWide),
+  };
+}
+
 /** Every category's live-comp multiples, tabulated for the method section, busiest categories first. */
 export function categoryTable(snapshot: Snapshot): CategoryRow[] {
   const comps = liveComps(snapshot);
   const glob = median(comps.map((q) => q.mcap_usd! / q.tvl_usd));
+  const offsets = offsetMapFor(comps);
   const by = new Map<string, number[]>();
   for (const q of comps) {
     const key = q.category ?? 'Uncategorised';
@@ -434,6 +744,7 @@ export function categoryTable(snapshot: Snapshot): CategoryRow[] {
     n: list.length,
     median: round4(median(list)),
     shrunk: round4((list.length * median(list) + MODEL.shrink_k * glob) / (list.length + MODEL.shrink_k)),
+    offset: round4(Math.exp(offsets.get(category === 'Uncategorised' ? '' : category) ?? 0)),
     p25: round4(quantile(list, 0.25)),
     p75: round4(quantile(list, 0.75)),
   }));
@@ -461,210 +772,478 @@ function residualBands(snapshot: Snapshot, fit: { a: number; b: number }): { glo
   return { global: [quantile(all, 0.25), quantile(all, 0.75)], byCat };
 }
 
-/** The first chain a protocol names, or a neutral phrase. */
-function chainOf(p: SnapshotProtocol): string {
-  return p.chains.length > 0 ? p.chains[0]! : 'its main chain';
-}
+/**
+ * Farm economics: one stated scenario for every row (research/DEBATE.md item 1, V2-SPEC section 3).
+ * A $1,000 position, held 90 days, in a launch that distributes 10% of the protocol's implied value
+ * pro-rata across its current TVL. Slice = 0.10 x implied x (1000 / TVL); fees = the plan's
+ * transaction count x the per-transaction cost of the cheapest chain the protocol lists; forgone
+ * yield = $1,000 at 4% a year for 90 days. Net = slice - fees - forgone. The break-even figure is
+ * the launch probability at which the farm would break even - a threshold printed for comparison,
+ * never a predicted probability, and no step anywhere in this file promises a token or a return.
+ */
+export const ECON = {
+  deposit_usd: 1000,
+  horizon_days: 90,
+  weeks: 13,
+  drop_share: 0.1,
+  forgone_rate: 0.04,
+};
 
-/** How much capital one farm position needs, from the protocol's own TVL. */
-function capitalFor(p: SnapshotProtocol): number {
-  if (p.tvl_usd >= 5_000_000_000) return 250;
-  if (p.tvl_usd >= 1_000_000_000) return 150;
-  if (p.tvl_usd >= 100_000_000) return 100;
-  return 50;
-}
+/** The forgone yield of the scenario: $1,000 parked for 90 days at 4% a year = $9.86. */
+export const FORGONE_USD = Math.round(ECON.deposit_usd * ECON.forgone_rate * (ECON.horizon_days / 365) * 100) / 100;
 
-/** How long to hold, from the protocol's age: younger protocols get a longer qualifying window. */
-function holdDaysFor(age: number | null): number {
-  if (age === null) return 30;
-  if (age < 180) return 60;
-  if (age < 365) return 45;
-  return 30;
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+const round1 = (n: number): number => Math.round(n * 10) / 10;
+
+/** A dollar figure with cents and thousands separators, for plan text: 1,000.00 style. */
+function usd(n: number): string {
+  return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 /**
- * Per-category farm actions: [core action, second qualifying action], with {name}, {chain} and
- * {cap} filled from the protocol's own record. Every category on the board has its own pair; the
- * default pair covers any category the snapshot adds later.
+ * Per-transaction cost in USD by chain: November 2026 planning estimates, printed on the dashboard
+ * as estimates, not quotes. Chains the table does not name use DEFAULT_TX_COST_USD.
  */
-const CATEGORY_ACTIONS: Record<string, [string, string]> = {
-  'Risk Curators': [
-    'Deposit ${cap} of USDC into a {name} vault on {chain} and keep the vault shares in the wallet; curator vaults track depositors by share balance over time.',
-    'Add a second, smaller deposit into a different {name} vault on {chain} a week later, so the wallet shows sustained allocation rather than a single touch.',
-  ],
-  'Onchain Capital Allocator': [
-    'Deposit ${cap} of USDC into a {name} allocation vault on {chain} and hold the shares; allocator points and launch snapshots are normally read off share balances.',
-    'Move a small part of the position between two {name} strategies on {chain} once a month, keeping the total deposited, to register as an active allocator.',
-  ],
-  'Collateral Markets': [
-    'Supply ${cap} of USDC as collateral through {name} on {chain} and keep the collateral position open and healthy.',
-    'Post a second collateral asset in the same {name} account on {chain} and leave both positions untouched except for one top-up a month.',
-  ],
-  'RWA': [
-    'Mint ${cap} of the {name} real-world-asset yield token on {chain} through its own app and hold it in the wallet; holder snapshots are how RWA launches usually find their users.',
-    'Keep the {name} position across a full distribution cycle on {chain} and claim the yield once, so the wallet shows a complete hold-and-claim history.',
-  ],
-  'Lending': [
-    'Supply ${cap} of USDC to {name} on {chain} and keep the supply position open; lending protocols read loyalty from supplied balances over time.',
-    'Borrow a small amount against the {name} supply on {chain}, repay it in full a week later, and keep supplying, so the wallet shows both sides of the market.',
-  ],
-  'CDP': [
-    'Deposit ${cap} of collateral into a {name} vault on {chain} and mint a small amount of its stablecoin against it, keeping the vault safely over-collateralised.',
-    'Repay part of the {name} debt and top the collateral up once on {chain}, so the vault shows managed, long-lived activity instead of a mint-and-run.',
-  ],
-  'CDP Manager': [
-    'Open a {name}-managed CDP on {chain} with ${cap} of collateral and mint a conservative amount of the stablecoin it manages.',
-    'Adjust the {name} vault once - a small collateral top-up on {chain} - and hold the position so the manager records an actively kept vault.',
-  ],
-  'Dexs': [
-    'Provide ${cap} of liquidity to the main {name} pool on {chain} and keep the LP position in range and in the wallet.',
-    'Route a few small swaps through {name} on {chain} each week, so the wallet appears both as a liquidity provider and as a trader.',
-  ],
-  'Yield': [
-    'Deposit ${cap} of USDC into the main {name} yield vault on {chain} and keep the vault shares unstaked in the wallet where snapshots can see them.',
-    'Compound the {name} yield once a month on {chain} instead of withdrawing it, so the balance history shows a holder, not a passer-by.',
-  ],
-  'Yield Aggregator': [
-    'Deposit ${cap} into a {name} aggregator vault on {chain} and let it route the funds; aggregator launches reward the wallets that stayed routed.',
-    'Split a second ${cap} deposit across another {name} vault on {chain} and hold both, showing breadth across the aggregator strategies.',
-  ],
-  'Chain': [
-    'Bridge ${cap} of funds to {chain} and hold them in the wallet; a chain that records no token yet can only reward wallets that actually live on it.',
-    'Use two or three native {chain} apps with the bridged funds each week, building a real on-chain history rather than a parked balance.',
-  ],
-  'Payments': [
-    'Fund the wallet with ${cap} and route a real payment through {name} on {chain}; payment networks count completed transfers, not deposits.',
-    'Make one {name} payment a week on {chain} to a second wallet you control, keeping each transfer small, real and easy to repeat.',
-  ],
-  'Restaking': [
-    'Restake ${cap} of the staking asset through {name} on {chain} and keep the restaking receipt in the wallet for the full holding period.',
-    'Delegate the {name} restaked position to an operator on {chain} and leave the delegation unchanged, since operator loyalty is part of most restaking snapshots.',
-  ],
-  'Liquid Restaking': [
-    'Mint ${cap} of the {name} liquid restaking token on {chain} and hold it in the wallet rather than looping it into another protocol.',
-    'Use a small part of the {name} receipt token in one partner app on {chain}, keeping the main position intact and traceable.',
-  ],
-  'Liquid Staking': [
-    'Stake ${cap} of the native asset through {name} on {chain} and hold the liquid staking receipt in the wallet.',
-    'Keep the {name} receipt across a full rewards epoch on {chain} and claim the staking rewards once, completing the hold-and-claim record.',
-  ],
-  'Restaked BTC': [
-    'Deposit ${cap} of BTC or its wrapped form into {name} on {chain} and keep the restaked position open for the full holding window.',
-    'Leave the {name} position untouched except for one small top-up on {chain}, so the wallet reads as a long-term BTC restaker.',
-  ],
-  'Decentralized BTC': [
-    'Bridge ${cap} of BTC value into {name} on {chain} using its own bridge route and hold the resulting position in the wallet.',
-    'Use the {name} BTC position in one paired app on {chain} - a borrow or a pool - while keeping the core amount in place.',
-  ],
-  'Anchor BTC': [
-    'Deposit ${cap} of BTC collateral into {name} on {chain} and keep the anchored position open and over-collateralised.',
-    'Make one small additional {name} deposit on {chain} a month later, showing the wallet is building the position, not testing it.',
-  ],
-  'Basis Trading': [
-    'Deposit ${cap} of USDC into the {name} basis strategy on {chain} and hold the strategy shares; basis vaults snapshot share balances, not trades.',
-    'Keep the {name} position through a full funding cycle on {chain} and add a small top-up after it, so the history spans more than one regime.',
-  ],
-  'CeDeFi': [
-    'Deposit ${cap} of USDC into a {name} earn product on {chain} and keep it there for the full term the product offers.',
-    'Roll the {name} position into a second term on {chain} when the first ends instead of withdrawing, which is the behaviour these products reward.',
-  ],
-  'Staking Pool': [
-    'Stake ${cap} of the native asset in the {name} pool on {chain} and keep the pooled stake delegated to the same validator set.',
-    'Claim and restake the {name} rewards once on {chain}, compounding the position the way long-term pool members do.',
-  ],
-  'Governance Incentives': [
-    'Deposit ${cap} into the {name} incentive program on {chain} and keep the position that earns the incentives open.',
-    'Take part in every {name} governance vote or incentive epoch on {chain} while the position runs; participation records are the product here.',
-  ],
-  'Insurance': [
-    'Buy ${cap} of cover from {name} on {chain} for a position you actually hold, and keep the policy to its full term.',
-    'Stake a smaller amount into a {name} cover pool on {chain} as an underwriter, so the wallet appears on both sides of the insurance market.',
-  ],
-  'Stablecoin Wrapper': [
-    'Mint ${cap} of the {name} wrapped stable asset on {chain} through its own app and hold the wrapped balance in the wallet.',
-    'Use part of the {name} wrapped asset in one listed partner market on {chain}, keeping the rest wrapped and untouched.',
-  ],
-  'Dual-Token Stablecoin': [
-    'Mint ${cap} of the {name} stablecoin on {chain} with its required collateral mix and hold both tokens the system issues.',
-    'Provide a small {name} liquidity position on {chain} for the stable pair and keep it in range across the holding period.',
-  ],
-  'Bridge': [
-    'Bridge ${cap} of USDC to {chain} through {name} and use the bridged funds in one app on the far side instead of bridging straight back.',
-    'Bridge a second, smaller amount through {name} in the opposite direction weeks later, giving the wallet a two-way bridge history.',
-  ],
-  'Canonical Bridge': [
-    'Bridge ${cap} of funds to {chain} through {name}, the canonical route, and hold the bridged balance in the wallet.',
-    'Spend part of the bridged funds in a native {chain} app each week, so the wallet is a chain user, not a bridge passer-by.',
-  ],
-  'Cross Chain Bridge': [
-    'Route ${cap} of USDC across chains through {name}, ending on {chain}, and keep the funds working there for the holding period.',
-    'Make one more {name} transfer on a different route weeks later, since cross-chain products score route diversity as well as volume.',
-  ],
-  'Derivatives': [
-    'Deposit ${cap} of USDC as margin on {name} on {chain} and open one small, hedged position rather than a directional bet.',
-    'Trade one small {name} contract a week on {chain} and keep margin in the account between trades, showing a returning trader.',
-  ],
-  'Farm': [
-    'Deposit ${cap} into the main {name} farm on {chain} and keep the farming position staked for the full holding period.',
-    'Harvest the {name} rewards once and restake them on {chain} instead of selling, so the wallet compounds like a committed farmer.',
-  ],
-  'Leveraged Farming': [
-    'Open a small {name} leveraged farm on {chain} with ${cap} of equity at the lowest leverage offered, and keep a wide safety margin.',
-    'Rebalance the {name} position once when prompted on {chain} rather than closing it, showing an actively managed leveraged farm.',
-  ],
-  'Liquidity Manager': [
-    'Deposit ${cap} into a {name}-managed liquidity vault on {chain} and keep the vault shares for the full holding period.',
-    'Leave the {name} vault through one full rebalance cycle on {chain} without withdrawing, since managed vaults snapshot patient wallets.',
-  ],
-  'Indexes': [
-    'Buy ${cap} of a {name} index product on {chain} and hold the index token in the wallet for the full period.',
-    'Add a second small {name} index purchase a month later on {chain}, building the position the way index holders actually do.',
-  ],
-  'OTC Marketplace': [
-    'Complete one small trade of about ${cap} through the {name} OTC desk route on {chain} and keep the settled asset in the wallet.',
-    'List or take one more {name} OTC offer weeks later on {chain}, so the wallet shows repeat marketplace use, not a single test trade.',
-  ],
-  'Crypto Card Issuer': [
-    'Fund a {name} card account with ${cap} through its {chain} route and make one real card payment from it.',
-    'Use the {name} card for one small payment a week, since card issuers score active spenders when they design holder rewards.',
-  ],
-  'Prediction Market': [
-    'Fund ${cap} and take one small position in a liquid {name} market on {chain}, choosing a market that settles inside the holding period.',
-    'Trade one more {name} market after the first settles on {chain} and keep the winnings in the account, building a settled-trade record.',
-  ],
-  'Uncollateralized Lending': [
-    'Supply ${cap} of USDC to a {name} lending pool on {chain} whose borrower set you can inspect, and keep the supply open for the pool term.',
-    'Roll the {name} supply into a second pool term on {chain} at maturity instead of exiting, the pattern these pools use to find loyal lenders.',
+const CHAIN_TX_COST_USD: Record<string, number> = {
+  Ethereum: 6,
+  Bitcoin: 4,
+  Stacks: 1,
+  Cardano: 0.2,
+  Binance: 0.3,
+  Polygon: 0.3,
+  Avalanche: 0.3,
+  Tron: 0.3,
+  Cronos: 0.3,
+  Core: 0.1,
+  Base: 0.25,
+  Arbitrum: 0.25,
+  Optimism: 0.25,
+  Ink: 0.25,
+  Linea: 0.25,
+  Scroll: 0.25,
+  'zkSync Era': 0.25,
+  Mantle: 0.25,
+  Mode: 0.25,
+  Blast: 0.25,
+  Taiko: 0.25,
+  Unichain: 0.25,
+  Monad: 0.25,
+  Sonic: 0.25,
+  Berachain: 0.25,
+  Plasma: 0.25,
+  Katana: 0.25,
+  'World Chain': 0.25,
+  'Robinhood Chain': 0.25,
+  BSquared: 0.25,
+  Solana: 0.05,
+  Sui: 0.05,
+  Aptos: 0.05,
+  TON: 0.05,
+  Near: 0.05,
+  Sei: 0.05,
+  Injective: 0.05,
+  Flare: 0.05,
+  Gnosis: 0.05,
+  Fantom: 0.05,
+  Hedera: 0.05,
+  Kaia: 0.05,
+  Bittensor: 0.05,
+  'Babylon Genesis': 0.05,
+  'Hyperliquid L1': 0.05,
+  Stellar: 0.01,
+  Algorand: 0.01,
+  Ripple: 0.01,
+};
+const DEFAULT_TX_COST_USD = 1;
+
+/** The chain-cost classes the dashboard prints, from the table above. */
+export const CHAIN_COST_TABLE: { label: string; usd: number }[] = [
+  { label: 'Ethereum mainnet', usd: 6 },
+  { label: 'Bitcoin', usd: 4 },
+  { label: 'Other chains (default estimate)', usd: 1 },
+  { label: 'Mid-cost chains (Binance, Polygon, Avalanche, Tron)', usd: 0.3 },
+  { label: 'Low-cost L2s (Base, Arbitrum, Ink, Linea and peers)', usd: 0.25 },
+  { label: 'Near-zero-fee chains (Solana, Sui, Stellar, Algorand and peers)', usd: 0.05 },
+];
+
+/** The cheapest chain a protocol lists, by the cost table: the chain a costed plan would use. */
+export function costChainFor(p: SnapshotProtocol): { chain: string; cost: number } {
+  let best: { chain: string; cost: number } | null = null;
+  for (const chain of p.chains) {
+    const cost = CHAIN_TX_COST_USD[chain] ?? DEFAULT_TX_COST_USD;
+    if (best === null || cost < best.cost) best = { chain, cost };
+  }
+  return best ?? { chain: 'its main chain', cost: DEFAULT_TX_COST_USD };
+}
+
+/**
+ * How a protocol is actually used, per category: a label, the two qualifying actions (with {name}
+ * and {chain} filled from the protocol's own record), and the plan's rhythm. Transaction counts are
+ * uniform so the fee maths can be checked: 2 setup + 2 action + 1 exit transactions, plus one a week
+ * for active mechanisms and none for hold mechanisms, over the scenario's 13 weeks.
+ */
+interface Mechanism {
+  label: string;
+  actions: [string, string];
+  weekly_txs: number;
+  setup_min: number;
+  weekly_min: number;
+}
+
+const HOLD = { weekly_txs: 0, setup_min: 25, weekly_min: 5 };
+const ACTIVE = { weekly_txs: 1, setup_min: 30, weekly_min: 10 };
+
+const MECHANISMS: Record<string, Mechanism> = {
+  'Risk Curators': {
+    label: 'curated vaults', ...HOLD,
+    actions: [
+      'Deposit the $1,000 of scenario capital as USDC into a {name} vault on {chain} and keep the vault shares in the wallet; write down the curator and the strategy named on the vault page.',
+      'After two weeks, move a quarter of the position into a second {name} vault on {chain}, keeping the total at $1,000 across both vaults.',
+    ],
+  },
+  'Onchain Capital Allocator': {
+    label: 'allocation vaults', ...HOLD,
+    actions: [
+      'Deposit the $1,000 of scenario capital as USDC into one {name} allocation vault on {chain} and record the strategy it follows.',
+      'After two weeks, shift a quarter of the position into a second {name} strategy vault on {chain}, keeping the total at $1,000.',
+    ],
+  },
+  Yield: {
+    label: 'yield vault', ...HOLD,
+    actions: [
+      'Deposit the $1,000 of scenario capital as USDC into the main {name} yield vault on {chain} and keep the vault shares in the wallet.',
+      'After two weeks, withdraw a tenth of the position and deposit it straight back, proving the exit path works while the position stays open.',
+    ],
+  },
+  'Yield Aggregator': {
+    label: 'auto-compounding vaults', ...HOLD,
+    actions: [
+      'Deposit the $1,000 of scenario capital into a {name} aggregator vault on {chain} and note which strategy the aggregator routes it to.',
+      'After two weeks, move a quarter of the position to a second {name} vault on {chain}, keeping the total at $1,000 across both.',
+    ],
+  },
+  RWA: {
+    label: 'tokenised real-world assets', ...HOLD,
+    actions: [
+      'Mint $1,000 of the {name} real-world-asset product on {chain} through its own app and hold the token in the wallet; check the app eligibility and minimum first, since some RWA products are gated.',
+      'Hold the position across one full distribution cycle and claim the yield once from the {name} app, completing a hold-and-claim record.',
+    ],
+  },
+  'Basis Trading': {
+    label: 'basis vault', ...HOLD,
+    actions: [
+      'Deposit the $1,000 of scenario capital as USDC into the {name} basis vault on {chain} and keep the strategy shares in the wallet.',
+      'After the first funding cycle, record the funding income the {name} dashboard reports and leave the position running into a second cycle.',
+    ],
+  },
+  CeDeFi: {
+    label: 'earn product (term)', ...HOLD,
+    actions: [
+      'Deposit the $1,000 of scenario capital as USDC into a {name} earn product on {chain} for the shortest term it offers.',
+      'When the first term ends, roll the position into a second term inside {name} instead of withdrawing it.',
+    ],
+  },
+  'Liquidity Manager': {
+    label: 'managed liquidity vault', ...HOLD,
+    actions: [
+      'Deposit the $1,000 of scenario capital into a {name}-managed liquidity vault on {chain} and keep the vault shares in the wallet.',
+      'Leave the position through one full rebalance cycle without withdrawing, then check the range and the fees the vault reports.',
+    ],
+  },
+  Farm: {
+    label: 'farm vault', ...HOLD,
+    actions: [
+      'Deposit the $1,000 of scenario capital into the main {name} farm on {chain} and stake the position for the full window.',
+      'Harvest the rewards the {name} farm page shows once and restake them into the same farm instead of selling.',
+    ],
+  },
+  'Staking Pool': {
+    label: 'staking pool', ...HOLD,
+    actions: [
+      'Stake $1,000 worth of the native asset in the {name} pool on {chain} and keep it delegated to the same validator set.',
+      'Claim the staking rewards once and restake them into the same {name} pool, compounding the position.',
+    ],
+  },
+  Restaking: {
+    label: 'restaking', ...HOLD,
+    actions: [
+      'Restake $1,000 worth of the staking asset through {name} on {chain} and keep the restaking receipt in the wallet.',
+      'Delegate the restaked position to one operator inside {name} and leave the delegation unchanged for the window.',
+    ],
+  },
+  Indexes: {
+    label: 'index token', ...HOLD,
+    actions: [
+      'Buy $1,000 of a {name} index product on {chain} and hold the index token in the wallet.',
+      'After a month, rebalance nothing and simply hold; check the index composition the {name} page reports against the token balance.',
+    ],
+  },
+  'Stablecoin Wrapper': {
+    label: 'wrapped stablecoin', ...HOLD,
+    actions: [
+      'Wrap $1,000 of USDC into the {name} wrapped stable asset on {chain} through its own app and hold the wrapped balance.',
+      'Use a tenth of the wrapped balance in one partner market the {name} app lists, keeping the rest wrapped.',
+    ],
+  },
+  'Collateral Markets': {
+    label: 'collateral supply', ...HOLD,
+    actions: [
+      'Supply $1,000 of USDC as collateral through {name} on {chain} and keep the collateral position open and healthy.',
+      'Top the collateral up by a tenth from the same wallet once, then leave both positions untouched.',
+    ],
+  },
+  Lending: {
+    label: 'lending market', ...ACTIVE,
+    actions: [
+      'Supply the $1,000 of scenario capital as USDC to {name} on {chain} and keep the supply position open.',
+      'Borrow a small amount against the supply, repay it in full a week later, and keep supplying, so the wallet shows both sides of the market.',
+    ],
+  },
+  Dexs: {
+    label: 'DEX liquidity', ...ACTIVE,
+    actions: [
+      'Provide the $1,000 of scenario capital as liquidity to the main {name} pool on {chain} and keep the LP position in range.',
+      'Route one small swap through {name} on {chain}, so the wallet appears as a trader as well as a liquidity provider.',
+    ],
+  },
+  Derivatives: {
+    label: 'perpetuals margin', ...ACTIVE,
+    actions: [
+      'Deposit the $1,000 of scenario capital as USDC margin on {name} on {chain} and open one small hedged position rather than a directional bet.',
+      'Close the first position, record the funding paid or received, and open one more small position the following week.',
+    ],
+  },
+  CDP: {
+    label: 'CDP vault', ...ACTIVE,
+    actions: [
+      'Deposit the $1,000 of scenario capital as collateral into a {name} vault on {chain} and mint a conservative amount of its stablecoin against it.',
+      'Repay part of the minted debt and top the collateral up once, keeping the vault safely over-collateralised.',
+    ],
+  },
+  'CDP Manager': {
+    label: 'managed CDP', ...ACTIVE,
+    actions: [
+      'Open a {name}-managed CDP on {chain} with the $1,000 of scenario capital as collateral and mint a conservative amount of the stablecoin it manages.',
+      'Adjust the vault once from the manager page - a small collateral top-up - and hold the position.',
+    ],
+  },
+  'Leveraged Farming': {
+    label: 'leveraged farm', ...ACTIVE,
+    actions: [
+      'Open a {name} leveraged farm on {chain} with the $1,000 of scenario capital as equity at the lowest leverage offered, keeping a wide safety margin.',
+      'Rebalance the position once when the app prompts, rather than closing it, and record the borrow cost paid.',
+    ],
+  },
+  'Prediction Market': {
+    label: 'prediction market', ...ACTIVE,
+    actions: [
+      'Fund the account with the $1,000 of scenario capital and take one small position in a liquid {name} market on {chain} that settles inside the window.',
+      'After the first market settles, take one more small position and keep the settled record in the account.',
+    ],
+  },
+  Chain: {
+    label: 'chain usage', ...ACTIVE,
+    actions: [
+      'Bridge the $1,000 of scenario capital to {chain} through the chain canonical route and hold it in the wallet on the far side.',
+      'Make one swap in a native {chain} app with the bridged funds, so the wallet is a chain user and not a parked balance.',
+    ],
+  },
+  'Interest Rate Derivatives': {
+    label: 'rate position', ...ACTIVE,
+    actions: [
+      'Open a small fixed-rate position on {chain} inside the {name} app using part of the $1,000 of scenario capital as margin.',
+      'Close the position at the end of its term and record the fixed rate actually paid against the floating rate.',
+    ],
+  },
+  'Dual-Token Stablecoin': {
+    label: 'stablecoin mint', ...ACTIVE,
+    actions: [
+      'Mint $1,000 of the {name} stablecoin on {chain} with its required collateral mix and hold both tokens the system issues.',
+      'Provide a small liquidity position for the stable pair on {chain} using part of the minted amount, keeping it in range.',
+    ],
+  },
+  'Decentralized BTC': {
+    label: 'BTC deposit', ...ACTIVE,
+    actions: [
+      'Deposit $1,000 worth of BTC into {name} through the deposit route its own app provides and hold the resulting position.',
+      'Withdraw a tenth of the BTC position back through the same route once, proving the exit works, and keep the rest in place.',
+    ],
+  },
+  'Anchor BTC': {
+    label: 'BTC anchor', ...ACTIVE,
+    actions: [
+      'Deposit $1,000 worth of BTC collateral into {name} on {chain} and keep the anchored position open and over-collateralised.',
+      'Make one small additional deposit a month later from the same wallet, showing the position is being built, not tested.',
+    ],
+  },
+  'Governance Incentives': {
+    label: 'governance program', ...ACTIVE,
+    actions: [
+      'Deposit the $1,000 of scenario capital into the {name} incentive program on {chain} and keep the earning position open.',
+      'Take part in one {name} governance vote or incentive epoch while the position runs; participation records are the product here.',
+    ],
+  },
+  Payments: {
+    label: 'payments', ...ACTIVE,
+    actions: [
+      'Fund the wallet with the $1,000 of scenario capital and route one real payment through {name} on {chain}.',
+      'Make one more {name} payment a week later to a second wallet you control, keeping each transfer small and real.',
+    ],
+  },
+  'Crypto Card Issuer': {
+    label: 'card account', ...ACTIVE,
+    actions: [
+      'Complete the {name} card account checks, fund it with part of the $1,000 of scenario capital through its own route, and make one real card payment.',
+      'Use the card for one small payment a week later, since card issuers record active spenders.',
+    ],
+  },
+  Insurance: {
+    label: 'cover policy', ...ACTIVE,
+    actions: [
+      'Buy $1,000 of cover notional from {name} on {chain} for a position you actually hold, and keep the policy to its term.',
+      'Record the premium and the exact cover terms from the policy page, and read the claim route once without filing.',
+    ],
+  },
+  'Uncollateralized Lending': {
+    label: 'uncollateralised pool', ...ACTIVE,
+    actions: [
+      'Supply the $1,000 of scenario capital as USDC to a {name} pool on {chain} whose borrower set you can inspect, for one pool term.',
+      'At maturity, roll the supply into a second pool term inside {name} instead of exiting, if a suitable pool is open.',
+    ],
+  },
+  'OTC Marketplace': {
+    label: 'OTC desk', ...ACTIVE,
+    actions: [
+      'Register for the {name} marketplace and complete the identity checks it requires before any offer can be taken.',
+      'Take one small listed offer of about $250 notional if the platform opens one to the wallet, and keep the settled asset.',
+    ],
+  },
+};
+
+const DEFAULT_MECHANISM: Mechanism = {
+  label: 'protocol position', ...HOLD,
+  actions: [
+    'Deposit the $1,000 of scenario capital as USDC into the main {name} product on {chain} through its own app and keep the position open.',
+    'Withdraw a tenth of the position once and deposit it straight back, proving the exit path works while the position stays open.',
   ],
 };
 
-const DEFAULT_ACTIONS: [string, string] = [
-  'Deposit ${cap} of USDC into {name} on {chain} and keep the position open; a protocol that records no token yet can only find the wallets that used it.',
-  'Make one more qualifying action in {name} on {chain} each week - a deposit, a swap or a vote, whichever its app offers - and never let the position lapse to zero.',
-];
+/** The mechanism a protocol is farmed through, from its category. */
+export function mechanismFor(p: SnapshotProtocol): Mechanism {
+  return MECHANISMS[p.category ?? ''] ?? DEFAULT_MECHANISM;
+}
 
-/** Fill a template with the protocol's own name, main chain and capital tier. */
-function fill(template: string, p: SnapshotProtocol, cap: number): string {
-  return template.split('{name}').join(p.name).split('{chain}').join(chainOf(p)).split('{cap}').join(String(cap));
+const SETUP_TXS = 2;
+const ACTION_TXS = 2;
+const EXIT_TXS = 1;
+
+/** One row's farm economics under the stated scenario, from its implied value and its mechanism. */
+export function farmEconomics(p: SnapshotProtocol, implied: number): FarmEcon {
+  const mech = mechanismFor(p);
+  const { chain, cost } = costChainFor(p);
+  const txs = SETUP_TXS + ACTION_TXS + mech.weekly_txs * ECON.weeks + EXIT_TXS;
+  const hours = (mech.setup_min + mech.weekly_min * ECON.weeks) / 60;
+  const slice = round2(ECON.drop_share * implied * (ECON.deposit_usd / p.tvl_usd));
+  const fees = round2(txs * cost);
+  const net = round2(slice - fees - FORGONE_USD);
+  return {
+    deposit_usd: ECON.deposit_usd,
+    slice_usd: slice,
+    fees_usd: fees,
+    forgone_usd: FORGONE_USD,
+    net_usd: net,
+    breakeven_pct: slice > 0 ? round1(((fees + FORGONE_USD) / slice) * 100) : null,
+    per_hour_usd: round2(net / hours),
+    hours: round1(hours),
+    txs,
+    chain,
+    chain_cost_usd: cost,
+  };
+}
+
+/** The verdict the stated odds rule gives a row the research table does not cover. */
+export function verdictFor(econ: FarmEcon): Verdict {
+  if (econ.breakeven_pct === null || econ.net_usd < 0) return 'SKIP';
+  if (econ.breakeven_pct <= 10) return 'FARM';
+  if (econ.breakeven_pct <= 33) return 'THIN';
+  return 'SKIP';
+}
+
+/** The closing step of a non-SKIP plan: the verdict and its arithmetic, in the open. */
+function verdictStep(p: SnapshotProtocol, verdict: Verdict, econ: FarmEcon, researched: boolean): string {
+  // Above 100% the break-even is not an odds figure: say, as the dashboard does, that the
+  // costs exceed the slice at this size instead of printing a probability over 100%.
+  const odds = econ.breakeven_pct === null
+    ? 'a break-even launch probability that is not computable on a zero slice'
+    : econ.breakeven_pct > 100
+      ? 'a break-even launch probability that is not reachable at this size, because the fees plus forgone yield exceed the scenario slice'
+      : `a break-even launch probability of ${econ.breakeven_pct}%`;
+  const source = researched ? ' The verdict itself comes from verified program research dated 2026-11-18 (see the protocol detail), not from this scenario.' : '';
+  return `Verdict: ${verdict} on the stated $1,000 scenario.${source} A launch distributing 10% of ${p.name} implied value pro-rata across TVL pays this position $${usd(econ.slice_usd)}; fees of $${usd(econ.fees_usd)} plus $${usd(econ.forgone_usd)} of forgone yield leave net $${usd(econ.net_usd)}, ${odds} and $${usd(econ.per_hour_usd)} per hour of plan time. Cost: $0. Time: 2 minutes to read.`;
+}
+
+/** A mechanism plan for a row with no researched plan: setup, two actions, the hold, the verdict. */
+function mechanismSteps(p: SnapshotProtocol, econ: FarmEcon): string[] {
+  const mech = mechanismFor(p);
+  const fill = (t: string): string => t.split('{name}').join(p.name).split('{chain}').join(econ.chain);
+  const setupGas = round2(SETUP_TXS * econ.chain_cost_usd);
+  const weeklyGas = round2(mech.weekly_txs * econ.chain_cost_usd * ECON.weeks);
+  const exitGas = round2(EXIT_TXS * econ.chain_cost_usd);
+  const hold =
+    mech.weekly_txs > 0
+      ? `Hold the position for the 90-day scenario window and repeat one small qualifying action each week on ${econ.chain}; if ${p.name} runs a points program it will normally read activity like this, but the snapshot records no program, so treat any points as unconfirmed until the protocol announces one. Cost: about $${usd(weeklyGas)} of gas across ${ECON.weeks} weekly actions, plus about $${usd(exitGas)} to exit at the end. Time: ${mech.weekly_min} minutes a week.`
+      : `Hold the position untouched for the 90-day scenario window and check it once a week; if ${p.name} runs a points program it will normally read balances like this, but the snapshot records no program, so treat any points as unconfirmed until the protocol announces one. Cost: about $${usd(exitGas)} to exit at the end, and nothing across the window. Time: ${mech.weekly_min} minutes a week.`;
+  return [
+    `Open ${p.name} in its own app and connect a fresh wallet on ${econ.chain}, the cheapest chain it lists at about $${usd(econ.chain_cost_usd)} per transaction in this model; a separate wallet keeps the farm auditable. Cost: about $${usd(setupGas)} of gas for funding and approvals. Time: ${mech.setup_min} minutes.`,
+    `${fill(mech.actions[0])} Cost: $1,000 of scenario capital; its transaction gas is counted in step 1. Time: 15 minutes.`,
+    `${fill(mech.actions[1])} Cost: about $${usd(round2(econ.chain_cost_usd))} of gas; the capital is already placed. Time: 10 minutes.`,
+    hold,
+  ];
+}
+
+/** A SKIP row's plan: why the numbers refuse, what to do instead, and the honesty line. */
+function skipSteps(p: SnapshotProtocol, econ: FarmEcon): string[] {
+  const odds = econ.breakeven_pct === null
+    ? 'the launch would need a break-even probability that is not computable on a zero slice to pay'
+    : econ.breakeven_pct > 100
+      ? 'the break-even probability is not reachable at this size, because the fees plus forgone yield exceed the scenario slice'
+      : `the launch would need a ${econ.breakeven_pct}% break-even probability to pay`;
+  return [
+    `Skip this farm on the stated $1,000 scenario: the position slice of $${usd(econ.slice_usd)} does not cover $${usd(econ.fees_usd)} of fees plus $${usd(econ.forgone_usd)} of forgone yield - net $${usd(econ.net_usd)}, and ${odds}, far above what an unannounced launch justifies staking on. Cost: $0. Time: 3 minutes to read the numbers.`,
+    `Do instead: keep ${p.name} on the watchlist and use its product only if the yield itself is the goal; re-check this row when its TVL, its fees or a confirmed program changes the arithmetic above. Cost: $0. Time: 5 minutes to set a reminder.`,
+    `No points program is recorded in the snapshot for ${p.name} and none is assumed anywhere in this plan; verify any program claim on the protocol official channels before depositing anything. Cost: $0. Time: 2 minutes.`,
+  ];
 }
 
 /**
- * A protocol's farm plan: five steps written for its category, its main chain and its size, from its
- * own record. No step promises a token: the snapshot says the protocol records no token yet, and the
- * last step says what to do if a launch comes.
+ * One row's complete farm plan: researched steps for the watchlist (lib/farmdata.ts, from
+ * research/FARM.md), mechanism steps for the rest, the verdict and the economics. Every plan
+ * ends with the verdict step, so the board's farm_steps carry the same arithmetic the dashboard
+ * prints; SKIP rows open with the refusal instead.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
-  const cap = capitalFor(p);
-  const hold = holdDaysFor(age);
-  const chain = chainOf(p);
-  const pair = CATEGORY_ACTIONS[p.category ?? ''] ?? DEFAULT_ACTIONS;
-  return [
-    `Set up a fresh wallet for ${p.name} and fund it with gas on ${chain}; a separate wallet keeps this farm auditable and limits the damage if one app is compromised. Cost: under $3 of gas for the first transactions. Time: 10 minutes.`,
-    `${fill(pair[0], p, cap)} Cost: $${cap} of capital plus about $${cap >= 150 ? 8 : 4} of gas. Time: 15 minutes to set up.`,
-    `${fill(pair[1], p, Math.max(25, Math.round(cap / 2)))} Cost: about $${Math.max(25, Math.round(cap / 2))} of capital plus a few dollars of gas. Time: 15 minutes.`,
-    `Keep the ${p.name} position open for at least ${hold} days and repeat one small qualifying action each week on ${chain}; snapshots and points programs reward wallets that stay active across weeks, not one-day deposits. Cost: about $2 of gas a week on top of the capital already placed. Time: 10 minutes a week for ${hold} days.`,
-    `${p.name} records no token yet in this snapshot, so follow its official channels for a points or launch announcement and, if a launch comes, claim only through the link the protocol itself publishes. Cost: nothing to watch, and never pay a third party to claim. Time: 15 minutes a week.`,
-  ];
+export function farmPlan(p: SnapshotProtocol, implied: number): { steps: string[]; verdict: Verdict; econ: FarmEcon; program: string | null; source: string | null } {
+  const econ = farmEconomics(p, implied);
+  const research = FARM_RESEARCH[p.slug];
+  if (research !== undefined) {
+    return {
+      steps: [...research.steps, verdictStep(p, research.verdict, econ, true)],
+      verdict: research.verdict,
+      econ,
+      program: research.program,
+      source: research.source,
+    };
+  }
+  // A FARM verdict needs two things: odds the scenario can pay, and a verified live program to
+  // farm. An unresearched row can only show the odds, so it caps at THIN however good they look.
+  const raw = verdictFor(econ);
+  const verdict: Verdict = raw === 'FARM' ? 'THIN' : raw;
+  return {
+    steps: verdict === 'SKIP' ? skipSteps(p, econ) : [...mechanismSteps(p, econ), verdictStep(p, verdict, econ, false)],
+    verdict,
+    econ,
+    program: null,
+    source: null,
+  };
 }
 
 /** The snapshot's protocol by slug. */
@@ -678,19 +1257,17 @@ export function buildBoard(snapshot: Snapshot): BoardRow[] {
   const comps = liveComps(snapshot);
   const fit = fitOls(comps);
   const chosen = new Map<string, SnapshotProtocol>();
-  // The watchlist is the floor: every slug, at any TVL. Above the floor the snapshot also carries
-  // products the watchlist rule itself excluded (wrapped, staked and bridged products of tokens
-  // that already trade, and exchanges), so the board adds nothing above the floor but the list.
+  // One classification standard on both sides of the floor (classifyProtocol): every stand-alone
+  // pre-token protocol in the snapshot is ranked, down to the snapshot's own $5M floor.
+  for (const p of snapshot.protocols) {
+    if (classifyProtocol(p) === 'ranked') chosen.set(p.slug, p);
+  }
+  // The watchlist is the floor: every slug is on the board whatever its class — the gate
+  // requires all 40, and on this snapshot every watchlist protocol classifies as ranked anyway.
   for (const slug of snapshot.watchlist) {
     const p = index.get(slug);
     if (p !== undefined) chosen.set(slug, p);
   }
-  // The early radar: rankable pre-token protocols below the watchlist floor, down to the board's
-  // own floor - the smaller launches the radar exists to find early.
-  const early = snapshot.protocols
-    .filter((p) => !chosen.has(p.slug) && isRankable(p) && p.tvl_usd >= MODEL.board_floor_usd && p.tvl_usd < snapshot.floor_usd)
-    .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
-  for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
     const v = radarValue(p, snapshot.as_of, fit, comps);
@@ -719,16 +1296,14 @@ export function buildBoard(snapshot: Snapshot): BoardRow[] {
       maturity_multiplier: round4(s.maturity),
       age_days: s.age,
     },
-    farm_steps: farmSteps(s.p, s.age),
+    farm_steps: farmPlan(s.p, s.implied).steps,
   }));
 }
 
-/** The live-token protocols, by market cap, for the dashboard's calibration strip. */
+/** The live-token comps, all of them, by market cap: the calibration set the dashboard tabulates. */
 export function liveRows(snapshot: Snapshot): LiveRow[] {
-  return snapshot.protocols
-    .filter((p) => !isPreToken(p) && p.category !== 'CEX')
+  return liveComps(snapshot)
     .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd)
-    .slice(0, LIVE_ROWS)
     .map((p) => ({
       slug: p.slug,
       name: p.name,
@@ -738,6 +1313,47 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
       mcap_usd: p.mcap_usd,
       change_7d: p.change_7d,
     }));
+}
+
+/** A small deterministic PRNG (mulberry32): the bootstrap must be reproducible byte for byte. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** How many bootstrap refits the rank ranges come from, and the fixed seed that makes them stable. */
+export const BOOTSTRAP_REFITS = 200;
+export const BOOTSTRAP_SEED = 20261118;
+
+/**
+ * Each board row's rank range: resample the 128 comps with replacement 200 times, refit radar-2
+ * on each resample, re-rank the whole board, and take the p10-p90 of the row's ranks. A narrow
+ * range means the rank survives refitting; a wide one is printed just as plainly.
+ */
+export function bootstrapRankRanges(board: BoardRow[], snapshot: Snapshot): Map<string, { lo: number; hi: number }> {
+  const comps = liveComps(snapshot);
+  const index = bySlug(snapshot.protocols);
+  const rows = board.map((r) => index.get(r.slug)).filter((p): p is SnapshotProtocol => p !== undefined);
+  const seen = new Map<string, number[]>();
+  for (const r of board) seen.set(r.slug, []);
+  const rand = mulberry32(BOOTSTRAP_SEED);
+  for (let i = 0; i < BOOTSTRAP_REFITS; i++) {
+    const sample: SnapshotProtocol[] = [];
+    for (let j = 0; j < comps.length; j++) sample.push(comps[Math.floor(rand() * comps.length)]!);
+    const fit = fitOls(sample);
+    const offsets = offsetMapFor(sample);
+    const scored = rows.map((p) => ({ slug: p.slug, v: radarValueFast(p, snapshot.as_of, fit, offsets) }));
+    scored.sort((a, b) => b.v - a.v || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+    scored.forEach((s, idx) => seen.get(s.slug)!.push(idx + 1));
+  }
+  const out = new Map<string, { lo: number; hi: number }>();
+  for (const [slug, arr] of seen) out.set(slug, { lo: Math.round(quantile(arr, 0.1)), hi: Math.round(quantile(arr, 0.9)) });
+  return out;
 }
 
 /** Everything the dashboard renders, from the snapshot. */
@@ -751,9 +1367,13 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   const categories = categoryTable(snapshot);
   const catByName = new Map(categories.map((c) => [c.category, c]));
   const watch = new Set(snapshot.watchlist);
+  const index = bySlug(snapshot.protocols);
+  const rankRanges = bootstrapRankRanges(board, snapshot);
   const rows: RadarRow[] = board.map((row) => {
     const band = bands.byCat.get(row.category ?? '') ?? bands.global;
     const cat = row.category === null ? undefined : catByName.get(row.category);
+    const plan = farmPlan(index.get(row.slug)!, row.implied_value_usd);
+    const range = rankRanges.get(row.slug) ?? { lo: row.rank, hi: row.rank };
     return {
       rank: row.rank,
       slug: row.slug,
@@ -773,12 +1393,20 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       cat_offset: round4(Math.exp(categoryOffset(row as unknown as SnapshotProtocol, comps).offset)),
       range_lo: Math.max(1, Math.round(row.implied_value_usd * Math.exp(band[0]))),
       range_hi: Math.round(row.implied_value_usd * Math.exp(band[1])),
+      rank_lo: range.lo,
+      rank_hi: range.hi,
       cat_n: cat?.n ?? 0,
       cat_median: cat ? cat.median : null,
       watchlist: watch.has(row.slug),
+      verdict: plan.verdict,
+      econ: plan.econ,
+      farm_program: plan.program,
+      farm_source: plan.source,
       farm_steps: row.farm_steps,
     };
   });
+  const verdict_counts = { FARM: 0, THIN: 0, SKIP: 0 };
+  for (const r of rows) verdict_counts[r.verdict]++;
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -796,6 +1424,21 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     validation,
     growth_grid: growth_grid.map((g) => ({ w: g.w, mean_log10: g.mean_log10, median_fold: g.median_fold })),
     categories,
+    partition: partitionOf(snapshot),
+    walk_forward: walkForward(snapshot),
+    extras: validationExtras(snapshot),
+    coverage: board.filter((r) => watch.has(r.slug)).length,
+    verdict_counts,
+    assumptions: {
+      deposit_usd: ECON.deposit_usd,
+      horizon_days: ECON.horizon_days,
+      weeks: ECON.weeks,
+      drop_share: ECON.drop_share,
+      forgone_rate: ECON.forgone_rate,
+      forgone_usd: FORGONE_USD,
+    },
+    chain_costs: CHAIN_COST_TABLE,
+    bootstrap: { refits: BOOTSTRAP_REFITS, seed: BOOTSTRAP_SEED },
     rows,
     live,
   };

@@ -1,15 +1,18 @@
 // LaunchScope, a token-radar-01 entry (Node 22, standard library only).
 //
-// The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores the
-// pre-token protocols with the radar-2 model in lib/model.ts (a power law fitted on the snapshot's
-// live-token comps, with a shrunk category offset and LOO-tuned growth and maturity factors), writes
-// the ranked board to /output/board.json, and copies this repository's dashboard/ and screenshots/
-// to /output. Last, it writes /output/dossier.json, the summary the judge reads, with the vendored
-// make.fun library.
+// The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), classifies
+// all 758 protocols under one standard (lib/model.ts: classifyProtocol), scores the 199 stand-alone
+// pre-token protocols with the radar-2 model (a power law fitted on the snapshot's live-token comps,
+// with a shrunk category offset and LOO-tuned growth and maturity factors), attaches a farm verdict
+// and $1,000-scenario economics to every row (researched verdicts for the 40 watchlist protocols live
+// in lib/farmdata.ts), writes the ranked board to /output/board.json, and copies this repository's
+// dashboard/ and screenshots/ to /output. Last, it writes /output/dossier.json, the summary the
+// judge reads, with the vendored make.fun library.
 //
 // The dashboard is a static page, no framework and no network: dashboard/index.html, dashboard/app.css
 // and dashboard/app.js read /output/data.js, which this program writes from the same board, together
-// with the model's leave-one-out validation table, so the page shows the measured evidence for the
+// with the model's validation evidence (leave-one-out table, two-cutoff walk-forward, hit rates,
+// band coverage audit, bootstrap rank ranges), so the page shows the measured evidence for the
 // model it ships.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
@@ -88,8 +91,12 @@ for (const name of shots) {
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
 const winner = radar.validation.find((v) => v.winner);
+const part = radar.partition;
+const wf = radar.walk_forward.map((r) => `${r.cutoff}: radar-2 ${r.radar2_mean_log10} vs flat ${r.flat_mean_log10}`).join('; ');
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
+    `token radar: partition ranked ${part.ranked}, trading ${part.trading}, sub-products ${part.sub_products}, exchanges ${part.exchanges}, versioned ${part.versioned}, set aside ${part.staking_products + part.bridge_products + part.named_products + part.zero_cap + part.sentinel_cap + part.unranked_small} (sum ${part.ranked + part.trading + part.sub_products + part.exchanges + part.versioned + part.staking_products + part.bridge_products + part.named_products + part.zero_cap + part.sentinel_cap + part.unranked_small} of ${part.total})\n` +
+    `token radar: verdicts FARM ${radar.verdict_counts.FARM}, THIN ${radar.verdict_counts.THIN}, SKIP ${radar.verdict_counts.SKIP}; walk-forward ${wf}\n` +
     `token radar: model ${radar.model_version} fitted on ${radar.comps_size} live comps (a=${radar.ols.intercept}, b=${radar.ols.slope}); leave-one-out winner ${winner ? `${winner.id} at mean |log10 err| ${winner.mean_log10}` : 'n/a'}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
